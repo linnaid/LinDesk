@@ -1,0 +1,12 @@
+# 本地配置与密钥
+configs/local.json
+.env
+
+# 构建产物
+bin/
+coverage.out
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/
