@@ -113,6 +113,181 @@ func TestCreateRefundRequestRejectsShippedOrder(t *testing.T) {
 	}
 }
 
+func TestApproveRefundRequest(t *testing.T) {
+	handler := newTestHandler()
+	createBody := strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`)
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", createResponse.Code, http.StatusCreated)
+	}
+
+	approveRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{
+  "comment": "订单未发货，符合退款规则"
+}`))
+	approveRequest.Header.Set("X-Actor-ID", "user_supervisor_001")
+	approveResponse := httptest.NewRecorder()
+
+	handler.ServeHTTP(approveResponse, approveRequest)
+
+	if approveResponse.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want %d, body = %s", approveResponse.Code, http.StatusOK, approveResponse.Body.String())
+	}
+	var body struct {
+		Request struct {
+			Status    string `json:"status"`
+			Approvals []struct {
+				Status  string `json:"status"`
+				Comment string `json:"comment"`
+			} `json:"approvals"`
+		} `json:"request"`
+		Approval struct {
+			Status  string `json:"status"`
+			Comment string `json:"comment"`
+		} `json:"approval"`
+	}
+	if err := json.NewDecoder(approveResponse.Body).Decode(&body); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	if body.Request.Status != "APPROVED" || body.Approval.Status != "APPROVED" {
+		t.Fatalf("body = %+v", body)
+	}
+	if len(body.Request.Approvals) != 1 || body.Request.Approvals[0].Comment != "订单未发货，符合退款规则" {
+		t.Fatalf("approvals = %+v", body.Request.Approvals)
+	}
+}
+
+func TestApproveRefundRequestRejectsSelfApproval(t *testing.T) {
+	handler := newTestHandler()
+	createBody := strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`)
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+
+	approveRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{
+  "comment": "不应通过"
+}`))
+	approveRequest.Header.Set("X-Actor-ID", "user_cs_001")
+	approveResponse := httptest.NewRecorder()
+
+	handler.ServeHTTP(approveResponse, approveRequest)
+
+	if approveResponse.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", approveResponse.Code, http.StatusForbidden)
+	}
+}
+
+func TestRecordRefundTransaction(t *testing.T) {
+	handler := newTestHandler()
+	createApprovedRefundRequest(t, handler)
+
+	transactionRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI202608040001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	transactionRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	transactionResponse := httptest.NewRecorder()
+
+	handler.ServeHTTP(transactionResponse, transactionRequest)
+
+	if transactionResponse.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %s", transactionResponse.Code, http.StatusOK, transactionResponse.Body.String())
+	}
+	var body struct {
+		Request struct {
+			Status             string `json:"status"`
+			RefundTransactions []struct {
+				Status           string `json:"status"`
+				ProviderRefundNo string `json:"provider_refund_no"`
+			} `json:"refund_transactions"`
+		} `json:"request"`
+		Transaction struct {
+			Status      string `json:"status"`
+			ProcessedBy string `json:"processed_by"`
+		} `json:"transaction"`
+	}
+	if err := json.NewDecoder(transactionResponse.Body).Decode(&body); err != nil {
+		t.Fatalf("decode transaction response: %v", err)
+	}
+	if body.Request.Status != "SUCCEEDED" || body.Transaction.Status != "SUCCEEDED" {
+		t.Fatalf("body = %+v", body)
+	}
+	if body.Transaction.ProcessedBy != "user_finance_001" {
+		t.Fatalf("ProcessedBy = %q", body.Transaction.ProcessedBy)
+	}
+	if len(body.Request.RefundTransactions) != 1 || body.Request.RefundTransactions[0].ProviderRefundNo != "ALI202608040001" {
+		t.Fatalf("refund transactions = %+v", body.Request.RefundTransactions)
+	}
+}
+
+func TestRecordRefundTransactionRejectsPendingReviewRequest(t *testing.T) {
+	handler := newTestHandler()
+	createBody := strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`)
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+
+	transactionRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI202608040001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	transactionRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	transactionResponse := httptest.NewRecorder()
+
+	handler.ServeHTTP(transactionResponse, transactionRequest)
+
+	if transactionResponse.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", transactionResponse.Code, http.StatusConflict)
+	}
+}
+
+func createApprovedRefundRequest(t *testing.T, handler http.Handler) {
+	t.Helper()
+
+	createBody := strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`)
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", createResponse.Code, http.StatusCreated)
+	}
+
+	approveRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{
+  "comment": "订单未发货，符合退款规则"
+}`))
+	approveRequest.Header.Set("X-Actor-ID", "user_supervisor_001")
+	approveResponse := httptest.NewRecorder()
+	handler.ServeHTTP(approveResponse, approveRequest)
+	if approveResponse.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want %d", approveResponse.Code, http.StatusOK)
+	}
+}
+
 func newTestHandler() http.Handler {
 	repository := refund.NewInMemoryRepository(refund.DemoOrders())
 	service := refund.NewService(

@@ -2,21 +2,33 @@
 
 ## 1. 服务对象
 
-LinDesk 是面向电商售后场景的内部工作台，优先服务以下角色：
+LinDesk 是面向电商/零售企业的多租户 AI Customer Agent 平台，第一阶段先把“未发货退款”这条高价值售后链路做深，再逐步扩展到售前咨询和订单操作。
+
+优先服务以下角色：
 
 - **客服专员**：查询订单，创建“未发货退款”申请，并向客户同步处理结果。
 - **客服主管**：审核普通退款申请，处理异常或高金额申请。
 - **仓配人员**：确认订单是否已经出库、发货或存在状态不一致。
 - **财务人员**：在支付渠道执行已审批退款，并登记退款渠道回执。
 - **运营管理员**：维护审核阈值、角色权限和异常处理规则。
+- **企业管理员**：维护租户、成员、品牌和平台级配置。
 
 消费者不直接登录 LinDesk；客服代表消费者发起申请。
+
+AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结、建议和话术生成。
+
+### 当前实现进度
+
+- 已完成：订单查询、退款申请创建、退款审批通过/驳回、财务退款回填、退款成功/失败结案、退款事务记录。
+- 暂用方案：通过 `X-Actor-ID` 模拟当前操作人，后续替换为真实登录态。
+- 暂未做：登录注册、多租户隔离、RBAC、真实支付渠道对接。
+- 推进建议：下一阶段统一做多租户底座和登录注册；这两项最好一起做，不要拆开。
 
 ## 2. 第一版范围
 
 ### 要做
 
-第一版只支持“**订单尚未发货，客户申请退款**”这一条售后链路：
+第一阶段只支持“**订单尚未发货，客户申请退款**”这一条售后链路，但平台结构要预留多租户、售前咨询和订单操作的扩展能力：
 
 1. 客服按订单号查询已支付订单及发货状态。
 2. 客服创建全额或不超过可退余额的退款申请，并填写原因和凭证说明。
@@ -24,14 +36,22 @@ LinDesk 是面向电商售后场景的内部工作台，优先服务以下角色
 4. 审核人批准或驳回申请；批准后由财务人工在支付渠道退款。
 5. 财务回填支付渠道退款单号和结果；客服据此通知客户。
 6. 全流程记录状态变化、操作人和审核意见，支持按订单号和申请状态查询。
+7. 所有核心数据预留 `tenant_id` 和审计字段，方便后续统一纳入多租户平台。
+
+### Agent 引入原则
+
+- 第一阶段先不让 Agent 直接执行退款或修改订单。
+- Agent 先做意图识别、上下文摘要、知识检索和回复草稿。
+- 只有在人工审批和后端规则保护下，才让 Agent 进入受控工具调用。
 
 ### 暂不做
 
 - 已发货、部分发货、拒收、退货入库、换货、补发等售后场景。
-- 消费者自助门户、聊天机器人和对外开放 API。
+- 消费者自助门户、完整外部 API 和多渠道统一接入。
 - 自动调用支付渠道退款、自动审批和自动打款。
+- 独立票务业务线；票务场景只借鉴限流、幂等、排队和锁等后端能力。
 - 优惠分摊、运费补偿、积分/券退回、跨订单合并退款。
-- 复杂规则引擎、报表中心、多租户和移动端。
+- 复杂规则引擎、报表中心和移动端。
 
 ## 3. 核心表
 
@@ -39,16 +59,18 @@ LinDesk 是面向电商售后场景的内部工作台，优先服务以下角色
 
 | 表 | 用途 | 关键字段与约束 |
 | --- | --- | --- |
+| `tenants` | 企业租户 | `id`、`name`、`status`、`plan`；`name` 唯一。 |
+| `tenant_members` | 租户成员与角色绑定 | `tenant_id`、`user_id`、`role_id`；同一租户下成员与角色组合唯一。 |
 | `users` | 内部操作人账号 | `id`、`name`、`email`、`status`；`email` 唯一。 |
-| `roles` / `user_roles` | RBAC 角色和人员授权 | 角色包括客服、客服主管、仓配、财务、运营管理员；`user_id + role_id` 唯一。 |
-| `customers` | 下单客户的最小必要信息 | `id`、`external_customer_id`、`masked_contact`；不保存非必要敏感信息。 |
-| `orders` | 订单快照与退款资格判断依据 | `id`、`external_order_no`、`customer_id`、`payment_status`、`fulfillment_status`、`paid_amount`、`currency`、`order_snapshot`；订单号唯一。 |
-| `order_items` | 订单商品明细 | `id`、`order_id`、`sku_id`、`quantity`、`paid_amount`；用于后续扩展部分退款。 |
-| `refund_requests` | 未发货退款申请主记录 | `id`、`request_no`、`order_id`、`requested_amount`、`reason_code`、`reason_note`、`status`、`submitted_by`、`submitted_at`；`request_no` 唯一。 |
-| `refund_request_items` | 退款申请涉及的商品行 | `id`、`refund_request_id`、`order_item_id`、`refund_amount`；第一版全额退款时仍保留，便于审计与扩展。 |
-| `approvals` | 审核任务及审核结论 | `id`、`refund_request_id`、`level`、`status`、`assignee_id`、`decision_by`、`decision_at`、`comment`；同一申请同一审核级别唯一。 |
-| `refund_transactions` | 财务在支付渠道执行退款后的回执 | `id`、`refund_request_id`、`provider`、`provider_refund_no`、`amount`、`status`、`processed_by`、`processed_at`；渠道退款单号唯一。 |
-| `audit_logs` | 不可变更的操作审计记录 | `id`、`entity_type`、`entity_id`、`action`、`operator_id`、`before_data`、`after_data`、`created_at`。 |
+| `roles` / `user_roles` | RBAC 角色和人员授权 | 角色包括客服、客服主管、仓配、财务、运营管理员；建议后续补充 `tenant_id` 以支持租户级授权。 |
+| `customers` | 下单客户的最小必要信息 | `tenant_id`、`id`、`external_customer_id`、`masked_contact`；不保存非必要敏感信息。 |
+| `orders` | 订单快照与退款资格判断依据 | `tenant_id`、`id`、`external_order_no`、`customer_id`、`payment_status`、`fulfillment_status`、`paid_amount`、`currency`、`order_snapshot`；订单号在租户内唯一。 |
+| `order_items` | 订单商品明细 | `tenant_id`、`id`、`order_id`、`sku_id`、`quantity`、`paid_amount`；用于后续扩展部分退款。 |
+| `refund_requests` | 未发货退款申请主记录 | `tenant_id`、`id`、`request_no`、`order_id`、`requested_amount`、`reason_code`、`reason_note`、`status`、`submitted_by`、`submitted_at`；`request_no` 在租户内唯一。 |
+| `refund_request_items` | 退款申请涉及的商品行 | `tenant_id`、`id`、`refund_request_id`、`order_item_id`、`refund_amount`；第一版全额退款时仍保留，便于审计与扩展。 |
+| `approvals` | 审核任务及审核结论 | `tenant_id`、`id`、`refund_request_id`、`level`、`status`、`assignee_id`、`decision_by`、`decision_at`、`comment`；同一申请同一审核级别唯一。 |
+| `refund_transactions` | 财务在支付渠道执行退款后的回执 | `tenant_id`、`id`、`refund_request_id`、`provider`、`provider_refund_no`、`amount`、`status`、`processed_by`、`processed_at`；渠道退款单号在全局或租户范围内唯一。 |
+| `audit_logs` | 不可变更的操作审计记录 | `tenant_id`、`id`、`entity_type`、`entity_id`、`action`、`operator_id`、`before_data`、`after_data`、`created_at`。 |
 
 关键索引与一致性要求：
 
@@ -97,7 +119,10 @@ LinDesk 是面向电商售后场景的内部工作台，优先服务以下角色
 以下结果即视为第一版可用：
 
 - 客服能够创建一笔符合资格的未发货退款申请，并在界面/API 中查询其完整状态。
+- 平台具备租户、角色和审计的扩展基础，后续可以无痛接入售前咨询和订单操作。
 - 系统拒绝已发货、未支付、金额超限和订单存在进行中退款的申请。
 - 审核、仓配确认和财务退款各自只能由相应角色操作，且提交人与审核人隔离。
 - 每次状态流转都能追溯到操作人、时间、意见和订单快照。
 - 退款不会因系统流程自动打款；没有财务人工回填渠道成功结果时，不得标记为退款成功。
+
+补充说明：当前代码已经跑通退款主闭环；后续重点是把内存仓储替换为 PostgreSQL，并补齐真实登录态、多租户隔离和 RBAC。

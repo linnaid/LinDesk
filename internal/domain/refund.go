@@ -17,9 +17,10 @@ const (
 
 // 记录由客服发起的退款申请。金额统一使用货币最小单位，例如人民币分。
 type RefundRequest struct {
-	ID              string
-	RequestNo       string // 退款申请编号
-	OrderID         string
+	ID        string
+	RequestNo string // 退款申请编号
+	OrderID   string
+	// OrderSnapshot 固化提交退款时的订单状态，后续审核和追溯都以这份快照为准。
 	OrderSnapshot   Order
 	RequestedAmount int64
 	ReasonCode      string // 退款原因代码

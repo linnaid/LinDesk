@@ -14,10 +14,11 @@ const (
 type Approval struct {
 	ID              string
 	RefundRequestID string
-	Level           int				// 审批级别
+	Level           int // 审批级别
 	Status          ApprovalStatus
-	AssigneeID      string			// 指定审批人
-	DecisionBy      string			// 实际操作人
-	DecisionAt      *time.Time
-	Comment         string			// 审批意见
+	AssigneeID      string // 指定审批人
+	DecisionBy      string // 实际操作人
+	// DecisionAt 在审批完成前保持 nil，便于区分待处理和已处理任务。
+	DecisionAt *time.Time
+	Comment    string // 审批意见
 }
