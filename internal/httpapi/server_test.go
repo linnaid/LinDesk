@@ -2,12 +2,14 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"lindesk/internal/auth"
 	"lindesk/internal/refund"
 )
 
@@ -188,6 +190,62 @@ func TestApproveRefundRequestRejectsSelfApproval(t *testing.T) {
 	}
 }
 
+func TestRefundFlowWithLoginAndRBAC(t *testing.T) {
+	handler := newSecureTestHandler()
+
+	csToken := loginToken(t, handler, "cs@lindesk.local")
+	supervisorToken := loginToken(t, handler, "supervisor@lindesk.local")
+	financeToken := loginToken(t, handler, "finance@lindesk.local")
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "reason_note": "客户取消未发货订单"
+}`))
+	createRequest.Header.Set("Authorization", "Bearer "+csToken)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body = %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+
+	approveRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{
+  "comment": "订单未发货，符合退款规则"
+}`))
+	approveRequest.Header.Set("Authorization", "Bearer "+supervisorToken)
+	approveResponse := httptest.NewRecorder()
+	handler.ServeHTTP(approveResponse, approveRequest)
+	if approveResponse.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want %d, body = %s", approveResponse.Code, http.StatusOK, approveResponse.Body.String())
+	}
+
+	transactionRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI202608040001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	transactionRequest.Header.Set("Authorization", "Bearer "+financeToken)
+	transactionResponse := httptest.NewRecorder()
+	handler.ServeHTTP(transactionResponse, transactionRequest)
+	if transactionResponse.Code != http.StatusOK {
+		t.Fatalf("transaction status = %d, want %d, body = %s", transactionResponse.Code, http.StatusOK, transactionResponse.Body.String())
+	}
+}
+
+func TestProtectedRouteRejectsMissingToken(t *testing.T) {
+	handler := newSecureTestHandler()
+	request := httptest.NewRequest(http.MethodGet, "/orders/LD202608040001", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestRecordRefundTransaction(t *testing.T) {
 	handler := newTestHandler()
 	createApprovedRefundRequest(t, handler)
@@ -298,4 +356,45 @@ func newTestHandler() http.Handler {
 	)
 
 	return NewHandler("lindesk", "test", Dependencies{Refunds: service})
+}
+
+func newSecureTestHandler() http.Handler {
+	repository := refund.NewInMemoryRepository(refund.DemoOrders())
+	refundService := refund.NewService(
+		repository,
+		50_000,
+		fixedHTTPClock{now: time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)},
+		refund.NewSequentialRequestNumberGenerator(),
+	)
+	authService := auth.NewService(auth.DemoTenants(time.Date(2026, time.August, 6, 0, 0, 0, 0, time.UTC)), auth.DemoUsers(time.Date(2026, time.August, 6, 0, 0, 0, 0, time.UTC)), auth.DemoRoles(), auth.DemoMemberships(time.Date(2026, time.August, 6, 0, 0, 0, 0, time.UTC)), func() time.Time {
+		return time.Date(2026, time.August, 6, 10, 0, 0, 0, time.UTC)
+	})
+
+	return NewHandler("lindesk", "test", Dependencies{Refunds: refundService, Auth: authService})
+}
+
+func loginToken(t *testing.T, handler http.Handler, email string) string {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(fmt.Sprintf(`{
+  "email": %q,
+  "password": "password123"
+}`, email)))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("login status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if body.Token == "" {
+		t.Fatalf("login token is empty")
+	}
+
+	return body.Token
 }
