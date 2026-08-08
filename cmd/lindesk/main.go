@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"lindesk/internal/auth"
 	"lindesk/internal/config"
 	"lindesk/internal/httpapi"
 	"lindesk/internal/refund"
@@ -37,8 +38,10 @@ func main() {
 		refund.SystemClock{},
 		refund.NewSequentialRequestNumberGenerator(),
 	)
+	authService := auth.NewDemoService()
 	server := httpapi.NewServer(cfg.Service.HTTPAddr, cfg.Service.Name, version, httpapi.Dependencies{
 		Refunds: refundService,
+		Auth:    authService,
 	})
 	shutdownTimeout := cfg.Service.ShutdownTimeout.Value()
 

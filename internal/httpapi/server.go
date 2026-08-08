@@ -1,17 +1,23 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
+	"lindesk/internal/auth"
 	"lindesk/internal/domain"
 	apprefund "lindesk/internal/refund"
 )
 
 type Dependencies struct {
 	Refunds *apprefund.Service
+	Auth    *auth.Service
 }
+
+type actorContextKey struct{}
 
 // 返回当前进程的网页服务。后续实现第一版流程时，业务接口会挂载到这个路由上。
 func NewServer(address, serviceName, version string, dependencies ...Dependencies) *http.Server {
@@ -36,13 +42,16 @@ func NewHandler(serviceName, version string, dependencies ...Dependencies) http.
 	mux.HandleFunc("GET /readyz", func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ready"})
 	})
+	if deps.Auth != nil {
+		mux.HandleFunc("POST /auth/login", handleLogin(deps.Auth))
+	}
 	if deps.Refunds != nil {
-		mux.HandleFunc("GET /orders/{external_order_no}", handleGetOrder(deps.Refunds))
-		mux.HandleFunc("POST /refund-requests", handleCreateRefundRequest(deps.Refunds))
-		mux.HandleFunc("GET /refund-requests/{request_no}", handleGetRefundRequest(deps.Refunds))
-		mux.HandleFunc("POST /refund-requests/{request_no}/approve", handleApproveRefundRequest(deps.Refunds))
-		mux.HandleFunc("POST /refund-requests/{request_no}/reject", handleRejectRefundRequest(deps.Refunds))
-		mux.HandleFunc("POST /refund-requests/{request_no}/refund-transactions", handleRecordRefundTransaction(deps.Refunds))
+		mux.HandleFunc("GET /orders/{external_order_no}", requirePermission(deps.Auth, domain.PermissionOrderRead, handleGetOrder(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests", requirePermission(deps.Auth, domain.PermissionRefundRequestCreate, handleCreateRefundRequest(deps.Refunds)))
+		mux.HandleFunc("GET /refund-requests/{request_no}", requirePermission(deps.Auth, domain.PermissionRefundRequestRead, handleGetRefundRequest(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests/{request_no}/approve", requirePermission(deps.Auth, domain.PermissionRefundRequestReview, handleApproveRefundRequest(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests/{request_no}/reject", requirePermission(deps.Auth, domain.PermissionRefundRequestReview, handleRejectRefundRequest(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests/{request_no}/refund-transactions", requirePermission(deps.Auth, domain.PermissionRefundTransactionWrite, handleRecordRefundTransaction(deps.Refunds)))
 	}
 
 	return mux
@@ -56,6 +65,94 @@ func resolveDependencies(dependencies []Dependencies) Dependencies {
 	return dependencies[0]
 }
 
+func handleLogin(auths *auth.Service) http.HandlerFunc {
+	type payload struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		TenantID string `json:"tenant_id"`
+	}
+
+	return func(writer http.ResponseWriter, request *http.Request) {
+		var body payload
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_json", "请求体必须是合法 JSON")
+			return
+		}
+
+		session, err := auths.Login(request.Context(), auth.LoginCommand{
+			Email:    body.Email,
+			Password: body.Password,
+			TenantID: body.TenantID,
+		})
+		if err != nil {
+			writeAuthError(writer, err)
+			return
+		}
+
+		writeJSON(writer, http.StatusOK, loginResponse{
+			Token:     session.Token,
+			TokenType: "Bearer",
+			ExpiresAt: session.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+			Actor:     newActorResponse(session.Actor),
+		})
+	}
+}
+
+// 为 HTTP handler 添加认证和权限校验
+// 只有当前用户已登录且拥有指定权限时，才会执行被包装的 handler
+func requirePermission(auths *auth.Service, permission domain.Permission, next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if auths == nil {
+			next(writer, request)
+			return
+		}
+
+		actor, err := auths.Authenticate(request.Context(), bearerToken(request.Header.Get("Authorization")))
+		if err != nil {
+			writeAuthError(writer, err)
+			return
+		}
+		if err := auth.RequirePermission(actor, permission); err != nil {
+			writeAuthError(writer, err)
+			return
+		}
+
+		ctx := context.WithValue(request.Context(), actorContextKey{}, actor)
+		next(writer, request.WithContext(ctx))
+	}
+}
+
+func currentActor(request *http.Request) (domain.Actor, bool) {
+	actor, ok := request.Context().Value(actorContextKey{}).(domain.Actor)
+	return actor, ok
+}
+
+func currentActorID(request *http.Request) string {
+	if actor, ok := currentActor(request); ok {
+		return actor.User.ID
+	}
+
+	return request.Header.Get("X-Actor-ID")
+}
+
+func bearerToken(header string) string {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return ""
+	}
+
+	prefix := "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+
+	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
+}
+
+// 返回一个 HTTP handler，用户根据外部订单号查询订单
+// 具体查询逻辑由 refund service 负责，handler 只负责处理HTTP请求和响应
 func handleGetOrder(refunds *apprefund.Service) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		order, err := refunds.GetOrder(request.Context(), request.PathValue("external_order_no"))
@@ -91,7 +188,7 @@ func handleCreateRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 			RequestedAmount: body.RequestedAmount,
 			ReasonCode:      body.ReasonCode,
 			ReasonNote:      body.ReasonNote,
-			SubmittedBy:     body.SubmittedBy,
+			SubmittedBy:     submittedBy(request, body.SubmittedBy),
 		})
 		if err != nil {
 			writeServiceError(writer, err)
@@ -128,8 +225,7 @@ func handleReviewRefundRequest(refunds *apprefund.Service, approved bool) http.H
 	}
 
 	return func(writer http.ResponseWriter, request *http.Request) {
-		// 先用 X-Actor-ID 模拟登录态；后续接 JWT 后只需替换这里的取值来源。
-		actorID := request.Header.Get("X-Actor-ID")
+		actorID := currentActorID(request)
 		if actorID == "" {
 			writeError(writer, http.StatusBadRequest, "validation_failed", "X-Actor-ID 不能为空")
 			return
@@ -180,7 +276,7 @@ func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc 
 	}
 
 	return func(writer http.ResponseWriter, request *http.Request) {
-		actorID := request.Header.Get("X-Actor-ID")
+		actorID := currentActorID(request)
 		if actorID == "" {
 			writeError(writer, http.StatusBadRequest, "validation_failed", "X-Actor-ID 不能为空")
 			return
@@ -213,6 +309,56 @@ func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc 
 			Transaction: newRefundTransactionResponse(result.Transaction),
 		})
 	}
+}
+
+type loginResponse struct {
+	Token     string        `json:"token"`
+	TokenType string        `json:"token_type"`
+	ExpiresAt string        `json:"expires_at"`
+	Actor     actorResponse `json:"actor"`
+}
+
+type actorResponse struct {
+	TenantID   string         `json:"tenant_id"`
+	TenantName string         `json:"tenant_name"`
+	UserID     string         `json:"user_id"`
+	UserName   string         `json:"user_name"`
+	Email      string         `json:"email"`
+	Roles      []roleResponse `json:"roles"`
+}
+
+type roleResponse struct {
+	Code        domain.RoleCode     `json:"code"`
+	Name        string              `json:"name"`
+	Permissions []domain.Permission `json:"permissions"`
+}
+
+func newActorResponse(actor domain.Actor) actorResponse {
+	roles := make([]roleResponse, 0, len(actor.Roles))
+	for _, role := range actor.Roles {
+		roles = append(roles, roleResponse{
+			Code:        role.Code,
+			Name:        role.Name,
+			Permissions: append([]domain.Permission(nil), role.Permissions...),
+		})
+	}
+
+	return actorResponse{
+		TenantID:   actor.Tenant.ID,
+		TenantName: actor.Tenant.Name,
+		UserID:     actor.User.ID,
+		UserName:   actor.User.Name,
+		Email:      actor.User.Email,
+		Roles:      roles,
+	}
+}
+
+func submittedBy(request *http.Request, fallback string) string {
+	if actor, ok := currentActor(request); ok {
+		return actor.User.ID
+	}
+
+	return fallback
 }
 
 type orderResponse struct {
@@ -358,6 +504,27 @@ func writeJSON(writer http.ResponseWriter, status int, payload any) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
 	_ = json.NewEncoder(writer).Encode(payload)
+}
+
+func writeAuthError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, auth.ErrEmailRequired),
+		errors.Is(err, auth.ErrPasswordRequired),
+		errors.Is(err, auth.ErrTenantRequired):
+		writeError(writer, http.StatusBadRequest, "validation_failed", err.Error())
+	case errors.Is(err, auth.ErrInvalidCredentials),
+		errors.Is(err, auth.ErrInvalidToken),
+		errors.Is(err, auth.ErrTokenRequired):
+		writeError(writer, http.StatusUnauthorized, "unauthorized", err.Error())
+	case errors.Is(err, auth.ErrTenantNotFound),
+		errors.Is(err, auth.ErrNoActiveMembership),
+		errors.Is(err, auth.ErrAmbiguousMembership):
+		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	case errors.Is(err, auth.ErrPermissionDenied):
+		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	default:
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+	}
 }
 
 func writeServiceError(writer http.ResponseWriter, err error) {
