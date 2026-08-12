@@ -17,6 +17,23 @@ type fixedHTTPClock struct {
 	now time.Time
 }
 
+const (
+	demoTenantID = "tenant_demo"
+	acmeTenantID = "tenant_acme"
+)
+
+type defaultTenantHandler struct {
+	next http.Handler
+}
+
+func (handler defaultTenantHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("X-Tenant-ID") == "" {
+		request.Header.Set("X-Tenant-ID", demoTenantID)
+	}
+
+	handler.next.ServeHTTP(writer, request)
+}
+
 func (clock fixedHTTPClock) Now() time.Time {
 	return clock.now
 }
@@ -246,6 +263,42 @@ func TestProtectedRouteRejectsMissingToken(t *testing.T) {
 	}
 }
 
+func TestSecureRefundRequestsAreTenantIsolated(t *testing.T) {
+	handler := newSecureTestHandler()
+	demoToken := loginToken(t, handler, "cs@lindesk.local")
+	acmeToken := loginToken(t, handler, "acme.cs@lindesk.local")
+
+	demoCreated := createSecureRefundRequest(t, handler, demoToken, 12_900)
+	if demoCreated.TenantID != demoTenantID {
+		t.Fatalf("demo tenant_id = %q, want %q", demoCreated.TenantID, demoTenantID)
+	}
+
+	acmeCrossTenantGet := httptest.NewRequest(http.MethodGet, "/refund-requests/"+demoCreated.RequestNo, nil)
+	acmeCrossTenantGet.Header.Set("Authorization", "Bearer "+acmeToken)
+	acmeCrossTenantResponse := httptest.NewRecorder()
+	handler.ServeHTTP(acmeCrossTenantResponse, acmeCrossTenantGet)
+	if acmeCrossTenantResponse.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant get status = %d, want %d", acmeCrossTenantResponse.Code, http.StatusNotFound)
+	}
+
+	acmeCreated := createSecureRefundRequest(t, handler, acmeToken, 25_900)
+	if acmeCreated.TenantID != acmeTenantID {
+		t.Fatalf("acme tenant_id = %q, want %q", acmeCreated.TenantID, acmeTenantID)
+	}
+	if acmeCreated.RequestNo != demoCreated.RequestNo {
+		t.Fatalf("request_no = %q and %q, want same tenant-scoped number", demoCreated.RequestNo, acmeCreated.RequestNo)
+	}
+
+	demoFetched := getSecureRefundRequest(t, handler, demoToken, demoCreated.RequestNo)
+	acmeFetched := getSecureRefundRequest(t, handler, acmeToken, acmeCreated.RequestNo)
+	if demoFetched.TenantID != demoTenantID || demoFetched.RequestedAmount != 12_900 {
+		t.Fatalf("demo fetched = %+v", demoFetched)
+	}
+	if acmeFetched.TenantID != acmeTenantID || acmeFetched.RequestedAmount != 25_900 {
+		t.Fatalf("acme fetched = %+v", acmeFetched)
+	}
+}
+
 func TestRecordRefundTransaction(t *testing.T) {
 	handler := newTestHandler()
 	createApprovedRefundRequest(t, handler)
@@ -355,7 +408,7 @@ func newTestHandler() http.Handler {
 		refund.NewSequentialRequestNumberGenerator(),
 	)
 
-	return NewHandler("lindesk", "test", Dependencies{Refunds: service})
+	return defaultTenantHandler{next: NewHandler("lindesk", "test", Dependencies{Refunds: service})}
 }
 
 func newSecureTestHandler() http.Handler {
@@ -397,4 +450,61 @@ func loginToken(t *testing.T, handler http.Handler, email string) string {
 	}
 
 	return body.Token
+}
+
+func createSecureRefundRequest(t *testing.T, handler http.Handler, token string, requestedAmount int64) struct {
+	TenantID        string `json:"tenant_id"`
+	RequestNo       string `json:"request_no"`
+	RequestedAmount int64  `json:"requested_amount"`
+} {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(fmt.Sprintf(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": %d,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "reason_note": "客户取消未发货订单"
+}`, requestedAmount)))
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body = %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+
+	var body struct {
+		TenantID        string `json:"tenant_id"`
+		RequestNo       string `json:"request_no"`
+		RequestedAmount int64  `json:"requested_amount"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	return body
+}
+
+func getSecureRefundRequest(t *testing.T, handler http.Handler, token string, requestNo string) struct {
+	TenantID        string `json:"tenant_id"`
+	RequestedAmount int64  `json:"requested_amount"`
+} {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/refund-requests/"+requestNo, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want %d, body = %s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	var body struct {
+		TenantID        string `json:"tenant_id"`
+		RequestedAmount int64  `json:"requested_amount"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+
+	return body
 }

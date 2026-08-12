@@ -13,8 +13,34 @@ type fixedClock struct {
 	now time.Time
 }
 
+const (
+	demoTenantID = "tenant_demo"
+	acmeTenantID = "tenant_acme"
+)
+
 func (clock fixedClock) Now() time.Time {
 	return clock.now
+}
+
+func TestGetOrderScopesByTenant(t *testing.T) {
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())
+
+	demoOrder, err := service.GetOrder(context.Background(), demoTenantID, "LD202608040001")
+	if err != nil {
+		t.Fatalf("demo GetOrder() error = %v", err)
+	}
+	acmeOrder, err := service.GetOrder(context.Background(), acmeTenantID, "LD202608040001")
+	if err != nil {
+		t.Fatalf("acme GetOrder() error = %v", err)
+	}
+
+	if demoOrder.TenantID != demoTenantID || demoOrder.RefundableAmount() != 12_900 {
+		t.Fatalf("demo order = %+v", demoOrder)
+	}
+	if acmeOrder.TenantID != acmeTenantID || acmeOrder.RefundableAmount() != 25_900 {
+		t.Fatalf("acme order = %+v", acmeOrder)
+	}
 }
 
 func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
@@ -23,6 +49,7 @@ func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 
 	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -37,8 +64,14 @@ func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
 	if request.RequestNo != "RR202608040001" {
 		t.Fatalf("RequestNo = %q, want RR202608040001", request.RequestNo)
 	}
+	if request.TenantID != demoTenantID {
+		t.Fatalf("TenantID = %q, want %q", request.TenantID, demoTenantID)
+	}
 	if request.Status != domain.RefundRequestStatusPendingReview {
 		t.Fatalf("Status = %q, want %q", request.Status, domain.RefundRequestStatusPendingReview)
+	}
+	if request.OrderSnapshot.TenantID != demoTenantID {
+		t.Fatalf("OrderSnapshot.TenantID = %q, want %q", request.OrderSnapshot.TenantID, demoTenantID)
 	}
 	if request.OrderSnapshot.ExternalOrderNo != "LD202608040001" {
 		t.Fatalf("OrderSnapshot.ExternalOrderNo = %q", request.OrderSnapshot.ExternalOrderNo)
@@ -49,6 +82,9 @@ func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
 	if len(repository.AuditLogs()) != 1 {
 		t.Fatalf("AuditLogs length = %d, want 1", len(repository.AuditLogs()))
 	}
+	if repository.AuditLogs()[0].TenantID != demoTenantID {
+		t.Fatalf("AuditLog.TenantID = %q, want %q", repository.AuditLogs()[0].TenantID, demoTenantID)
+	}
 }
 
 func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
@@ -56,6 +92,7 @@ func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
 	repository := NewInMemoryRepository([]domain.Order{
 		{
 			ID:                "order_high",
+			TenantID:          demoTenantID,
 			ExternalOrderNo:   "LD202608040099",
 			CustomerID:        "customer_high",
 			PaymentStatus:     domain.PaymentStatusPaid,
@@ -68,6 +105,7 @@ func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 
 	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040099",
 		RequestedAmount: 50_000,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -86,6 +124,7 @@ func TestCreateRequestRejectsIneligibleOrder(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())
 
 	_, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040002",
 		RequestedAmount: 8_800,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -101,6 +140,7 @@ func TestCreateRequestRejectsAmountAboveRefundableBalance(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())
 
 	_, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_901,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -116,6 +156,7 @@ func TestCreateRequestRejectsActiveRequestForSameOrder(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	command := CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -131,11 +172,79 @@ func TestCreateRequestRejectsActiveRequestForSameOrder(t *testing.T) {
 	}
 }
 
+func TestCreateRequestScopesActiveRequestsByTenant(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+
+	demoDetail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	})
+	if err != nil {
+		t.Fatalf("demo CreateRequest() error = %v", err)
+	}
+
+	acmeDetail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        acmeTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 25_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_acme_cs_001",
+	})
+	if err != nil {
+		t.Fatalf("acme CreateRequest() error = %v", err)
+	}
+	if demoDetail.Request.RequestNo != acmeDetail.Request.RequestNo {
+		t.Fatalf("RequestNo = %q and %q, want same tenant-scoped number", demoDetail.Request.RequestNo, acmeDetail.Request.RequestNo)
+	}
+	if acmeDetail.Request.OrderSnapshot.PaidAmount != 25_900 {
+		t.Fatalf("acme PaidAmount = %d, want 25900", acmeDetail.Request.OrderSnapshot.PaidAmount)
+	}
+
+	_, err = service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	})
+	if !errors.Is(err, ErrActiveRefundRequestExists) {
+		t.Fatalf("second demo CreateRequest() error = %v, want %v", err, ErrActiveRefundRequestExists)
+	}
+}
+
+func TestGetRequestReturnsNotFoundAcrossTenant(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+
+	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest() error = %v", err)
+	}
+
+	_, err = service.GetRequest(context.Background(), acmeTenantID, detail.Request.RequestNo)
+	if !errors.Is(err, ErrRefundRequestNotFound) {
+		t.Fatalf("GetRequest() error = %v, want %v", err, ErrRefundRequestNotFound)
+	}
+}
+
 func TestApproveRequestTransitionsToApprovedAndStoresApproval(t *testing.T) {
 	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -145,6 +254,7 @@ func TestApproveRequestTransitionsToApprovedAndStoresApproval(t *testing.T) {
 	}
 
 	result, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_supervisor_001",
 		Comment:    "订单未发货，符合退款规则",
@@ -174,6 +284,7 @@ func TestApproveRequestRejectsSubmitterSelfApproval(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -183,6 +294,7 @@ func TestApproveRequestRejectsSubmitterSelfApproval(t *testing.T) {
 	}
 
 	_, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_cs_001",
 		Comment:    "不应通过",
@@ -197,6 +309,7 @@ func TestRejectRequestTransitionsToRejected(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -206,6 +319,7 @@ func TestRejectRequestTransitionsToRejected(t *testing.T) {
 	}
 
 	result, err := service.RejectRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_supervisor_001",
 		Comment:    "客户信息不完整，驳回",
@@ -226,6 +340,7 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -234,6 +349,7 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 		t.Fatalf("CreateRequest() error = %v", err)
 	}
 	if _, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_supervisor_001",
 		Comment:    "订单未发货，符合退款规则",
@@ -242,6 +358,7 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 	}
 
 	result, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         demoTenantID,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -274,6 +391,7 @@ func TestRecordTransactionTransitionsApprovedRequestToFailed(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -282,6 +400,7 @@ func TestRecordTransactionTransitionsApprovedRequestToFailed(t *testing.T) {
 		t.Fatalf("CreateRequest() error = %v", err)
 	}
 	if _, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_supervisor_001",
 		Comment:    "订单未发货，符合退款规则",
@@ -290,6 +409,7 @@ func TestRecordTransactionTransitionsApprovedRequestToFailed(t *testing.T) {
 	}
 
 	result, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:      demoTenantID,
 		RequestNo:     "RR202608040001",
 		Provider:      "alipay",
 		Amount:        12_900,
@@ -313,6 +433,7 @@ func TestRecordTransactionRejectsPendingReviewRequest(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -322,6 +443,7 @@ func TestRecordTransactionRejectsPendingReviewRequest(t *testing.T) {
 	}
 
 	_, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         demoTenantID,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -339,6 +461,7 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -347,6 +470,7 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 		t.Fatalf("CreateRequest() error = %v", err)
 	}
 	if _, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
 		RequestNo:  "RR202608040001",
 		DecisionBy: "user_supervisor_001",
 		Comment:    "订单未发货，符合退款规则",
@@ -355,6 +479,7 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 	}
 
 	_, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         demoTenantID,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -364,5 +489,62 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTransactionAmountMismatch) {
 		t.Fatalf("RecordTransaction() error = %v, want %v", err, ErrTransactionAmountMismatch)
+	}
+}
+
+func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}); err != nil {
+		t.Fatalf("demo CreateRequest() error = %v", err)
+	}
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        acmeTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 25_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_acme_cs_001",
+	}); err != nil {
+		t.Fatalf("acme CreateRequest() error = %v", err)
+	}
+
+	for _, command := range []ReviewRequestCommand{
+		{TenantID: demoTenantID, RequestNo: "RR202608040001", DecisionBy: "user_supervisor_001", Comment: "订单未发货，符合退款规则"},
+		{TenantID: acmeTenantID, RequestNo: "RR202608040001", DecisionBy: "user_acme_supervisor_001", Comment: "订单未发货，符合退款规则"},
+	} {
+		if _, err := service.ApproveRequest(context.Background(), command); err != nil {
+			t.Fatalf("ApproveRequest(%s) error = %v", command.TenantID, err)
+		}
+	}
+
+	if _, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         demoTenantID,
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI-SAME-REFUND-NO",
+		Amount:           12_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_finance_001",
+	}); err != nil {
+		t.Fatalf("demo RecordTransaction() error = %v", err)
+	}
+	if _, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         acmeTenantID,
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI-SAME-REFUND-NO",
+		Amount:           25_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_acme_finance_001",
+	}); err != nil {
+		t.Fatalf("acme RecordTransaction() error = %v", err)
 	}
 }
