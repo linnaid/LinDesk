@@ -17,14 +17,14 @@ import (
 var (
 	ErrEmailRequired       = errors.New("email is required")
 	ErrPasswordRequired    = errors.New("password is required")
-	ErrInvalidCredentials  = errors.New("email or password is invalid")			// 用户名密码错误
-	ErrTenantRequired      = errors.New("tenant is required")					// 租户未指定
+	ErrInvalidCredentials  = errors.New("email or password is invalid") // 用户名密码错误
+	ErrTenantRequired      = errors.New("tenant is required")           // 租户未指定
 	ErrTenantNotFound      = errors.New("tenant not found")
 	ErrTokenRequired       = errors.New("authorization token is required")
 	ErrInvalidToken        = errors.New("authorization token is invalid")
 	ErrPermissionDenied    = errors.New("permission denied")
-	ErrNoActiveMembership  = errors.New("user has no active tenant membership")	// 没有租户关系
-	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")		// 多租户歧义
+	ErrNoActiveMembership  = errors.New("user has no active tenant membership") // 没有租户关系
+	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户歧义
 )
 
 type LoginCommand struct {
@@ -35,9 +35,9 @@ type LoginCommand struct {
 
 // 一个已经登陆成功的用户会话
 type Session struct {
-	Token     string		// 身份凭证
-	Actor     domain.Actor	
-	ExpiresAt time.Time		// 过期时间
+	Token     string // 身份凭证
+	Actor     domain.Actor
+	ExpiresAt time.Time // 过期时间
 }
 
 // Service 是当前阶段的身份服务，负责登录、解析 token 和权限判断。
@@ -47,9 +47,9 @@ type Service struct {
 	tenantByID  map[string]domain.Tenant
 	userByID    map[string]domain.User
 	userByEmail map[string]domain.User
-	roleByCode  map[domain.RoleCode]domain.Role	// 角色表
-	memberships []domain.TenantMember			// 用户属于哪些租户
-	sessions    map[string]Session				// 保存登陆状态
+	roleByCode  map[domain.RoleCode]domain.Role // 角色表
+	memberships []domain.TenantMember           // 用户属于哪些租户
+	sessions    map[string]Session              // 保存登陆状态
 	now         func() time.Time
 }
 
@@ -223,6 +223,7 @@ func HashPassword(password string) string {
 func DemoTenants(now time.Time) []domain.Tenant {
 	return []domain.Tenant{
 		{ID: "tenant_demo", Name: "LinDesk Demo 电商", Status: domain.TenantStatusActive, CreatedAt: now},
+		{ID: "tenant_acme", Name: "Acme 零售旗舰店", Status: domain.TenantStatusActive, CreatedAt: now},
 	}
 }
 
@@ -234,6 +235,9 @@ func DemoUsers(now time.Time) []domain.User {
 		{ID: "user_supervisor_001", Name: "主管一号", Email: "supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_finance_001", Name: "财务一号", Email: "finance@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_admin_001", Name: "管理员一号", Email: "admin@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
+		{ID: "user_acme_cs_001", Name: "Acme 客服一号", Email: "acme.cs@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
+		{ID: "user_acme_supervisor_001", Name: "Acme 主管一号", Email: "acme.supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
+		{ID: "user_acme_finance_001", Name: "Acme 财务一号", Email: "acme.finance@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 	}
 }
 
@@ -286,5 +290,8 @@ func DemoMemberships(now time.Time) []domain.TenantMember {
 		{TenantID: "tenant_demo", UserID: "user_supervisor_001", RoleCode: domain.RoleSupervisor, JoinedAt: now},
 		{TenantID: "tenant_demo", UserID: "user_finance_001", RoleCode: domain.RoleFinance, JoinedAt: now},
 		{TenantID: "tenant_demo", UserID: "user_admin_001", RoleCode: domain.RoleTenantAdmin, JoinedAt: now},
+		{TenantID: "tenant_acme", UserID: "user_acme_cs_001", RoleCode: domain.RoleCustomerService, JoinedAt: now},
+		{TenantID: "tenant_acme", UserID: "user_acme_supervisor_001", RoleCode: domain.RoleSupervisor, JoinedAt: now},
+		{TenantID: "tenant_acme", UserID: "user_acme_finance_001", RoleCode: domain.RoleFinance, JoinedAt: now},
 	}
 }

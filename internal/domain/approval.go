@@ -13,6 +13,7 @@ const (
 // 独立于退款申请，便于普通退款和高金额退款的多级审核都能被审计。
 type Approval struct {
 	ID              string
+	TenantID        string
 	RefundRequestID string
 	Level           int // 审批级别
 	Status          ApprovalStatus

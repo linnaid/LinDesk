@@ -137,6 +137,14 @@ func currentActorID(request *http.Request) string {
 	return request.Header.Get("X-Actor-ID")
 }
 
+func currentTenantID(request *http.Request) string {
+	if actor, ok := currentActor(request); ok {
+		return actor.Tenant.ID
+	}
+
+	return request.Header.Get("X-Tenant-ID")
+}
+
 func bearerToken(header string) string {
 	header = strings.TrimSpace(header)
 	if header == "" {
@@ -155,7 +163,7 @@ func bearerToken(header string) string {
 // 具体查询逻辑由 refund service 负责，handler 只负责处理HTTP请求和响应
 func handleGetOrder(refunds *apprefund.Service) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		order, err := refunds.GetOrder(request.Context(), request.PathValue("external_order_no"))
+		order, err := refunds.GetOrder(request.Context(), currentTenantID(request), request.PathValue("external_order_no"))
 		if err != nil {
 			writeServiceError(writer, err)
 			return
@@ -184,6 +192,7 @@ func handleCreateRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 		}
 
 		detail, err := refunds.CreateRequest(request.Context(), apprefund.CreateRequestCommand{
+			TenantID:        currentTenantID(request),
 			ExternalOrderNo: body.ExternalOrderNo,
 			RequestedAmount: body.RequestedAmount,
 			ReasonCode:      body.ReasonCode,
@@ -201,7 +210,7 @@ func handleCreateRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 
 func handleGetRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		detail, err := refunds.GetRequest(request.Context(), request.PathValue("request_no"))
+		detail, err := refunds.GetRequest(request.Context(), currentTenantID(request), request.PathValue("request_no"))
 		if err != nil {
 			writeServiceError(writer, err)
 			return
@@ -240,6 +249,7 @@ func handleReviewRefundRequest(refunds *apprefund.Service, approved bool) http.H
 		}
 
 		command := apprefund.ReviewRequestCommand{
+			TenantID:   currentTenantID(request),
 			RequestNo:  request.PathValue("request_no"),
 			DecisionBy: actorID,
 			Comment:    body.Comment,
@@ -291,6 +301,7 @@ func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc 
 		}
 
 		result, err := refunds.RecordTransaction(request.Context(), apprefund.RecordTransactionCommand{
+			TenantID:         currentTenantID(request),
 			RequestNo:        request.PathValue("request_no"),
 			Provider:         body.Provider,
 			ProviderRefundNo: body.ProviderRefundNo,
@@ -363,6 +374,7 @@ func submittedBy(request *http.Request, fallback string) string {
 
 type orderResponse struct {
 	ID                string                   `json:"id"`
+	TenantID          string                   `json:"tenant_id"`
 	ExternalOrderNo   string                   `json:"external_order_no"`
 	CustomerID        string                   `json:"customer_id"`
 	PaymentStatus     domain.PaymentStatus     `json:"payment_status"`
@@ -377,6 +389,7 @@ type orderResponse struct {
 
 type refundRequestResponse struct {
 	ID                         string                     `json:"id"`
+	TenantID                   string                     `json:"tenant_id"`
 	RequestNo                  string                     `json:"request_no"`
 	OrderID                    string                     `json:"order_id"`
 	OrderSnapshot              orderResponse              `json:"order_snapshot"`
@@ -394,6 +407,7 @@ type refundRequestResponse struct {
 
 type approvalResponse struct {
 	ID              string                `json:"id"`
+	TenantID        string                `json:"tenant_id"`
 	RefundRequestID string                `json:"refund_request_id"`
 	Level           int                   `json:"level"`
 	Status          domain.ApprovalStatus `json:"status"`
@@ -410,6 +424,7 @@ type reviewResultResponse struct {
 
 type refundTransactionResponse struct {
 	ID               string                         `json:"id"`
+	TenantID         string                         `json:"tenant_id"`
 	RefundRequestID  string                         `json:"refund_request_id"`
 	Provider         string                         `json:"provider"`
 	ProviderRefundNo string                         `json:"provider_refund_no"`
@@ -428,6 +443,7 @@ type transactionResultResponse struct {
 func newOrderResponse(order domain.Order) orderResponse {
 	return orderResponse{
 		ID:                order.ID,
+		TenantID:          order.TenantID,
 		ExternalOrderNo:   order.ExternalOrderNo,
 		CustomerID:        order.CustomerID,
 		PaymentStatus:     order.PaymentStatus,
@@ -453,6 +469,7 @@ func newRefundRequestResponse(detail apprefund.RequestDetail) refundRequestRespo
 	}
 	return refundRequestResponse{
 		ID:                         request.ID,
+		TenantID:                   request.TenantID,
 		RequestNo:                  request.RequestNo,
 		OrderID:                    request.OrderID,
 		OrderSnapshot:              newOrderResponse(request.OrderSnapshot),
@@ -476,6 +493,7 @@ func newApprovalResponse(approval domain.Approval) approvalResponse {
 
 	return approvalResponse{
 		ID:              approval.ID,
+		TenantID:        approval.TenantID,
 		RefundRequestID: approval.RefundRequestID,
 		Level:           approval.Level,
 		Status:          approval.Status,
@@ -489,6 +507,7 @@ func newApprovalResponse(approval domain.Approval) approvalResponse {
 func newRefundTransactionResponse(transaction domain.RefundTransaction) refundTransactionResponse {
 	return refundTransactionResponse{
 		ID:               transaction.ID,
+		TenantID:         transaction.TenantID,
 		RefundRequestID:  transaction.RefundRequestID,
 		Provider:         transaction.Provider,
 		ProviderRefundNo: transaction.ProviderRefundNo,
@@ -530,13 +549,18 @@ func writeAuthError(writer http.ResponseWriter, err error) {
 func writeServiceError(writer http.ResponseWriter, err error) {
 	// 将领域错误映射成前端更容易处理的 HTTP 状态码。
 	switch {
+	// 404 资源不存在
 	case errors.Is(err, apprefund.ErrOrderNotFound), errors.Is(err, apprefund.ErrRefundRequestNotFound):
 		writeError(writer, http.StatusNotFound, "not_found", err.Error())
+	// 409 状态冲突
 	case errors.Is(err, apprefund.ErrActiveRefundRequestExists):
 		writeError(writer, http.StatusConflict, "active_refund_request_exists", err.Error())
+	// 422 业务规则不允许
 	case errors.Is(err, apprefund.ErrOrderNotRefundable), errors.Is(err, apprefund.ErrAmountExceedsRefundable):
 		writeError(writer, http.StatusUnprocessableEntity, "refund_request_not_allowed", err.Error())
+	// 400 参数校验失败
 	case errors.Is(err, apprefund.ErrExternalOrderNoRequired),
+		errors.Is(err, apprefund.ErrTenantRequired),
 		errors.Is(err, apprefund.ErrRequestedAmountPositive),
 		errors.Is(err, apprefund.ErrReasonCodeRequired),
 		errors.Is(err, apprefund.ErrSubmittedByRequired),
@@ -544,14 +568,19 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 		errors.Is(err, apprefund.ErrApprovalDecisionByRequired),
 		errors.Is(err, apprefund.ErrApprovalCommentRequired):
 		writeError(writer, http.StatusBadRequest, "validation_failed", err.Error())
+	// 403 权限禁止
 	case errors.Is(err, apprefund.ErrApprovalActorSameAsSubmitter):
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	// 409 退款申请状态错误
 	case errors.Is(err, apprefund.ErrRefundRequestNotReviewable):
 		writeError(writer, http.StatusConflict, "refund_request_not_reviewable", err.Error())
+	// 409 退款未批准
 	case errors.Is(err, apprefund.ErrRefundRequestNotApproved):
 		writeError(writer, http.StatusConflict, "refund_request_not_approved", err.Error())
+	// 409 退款流水号冲突
 	case errors.Is(err, apprefund.ErrProviderRefundNoExists):
 		writeError(writer, http.StatusConflict, "provider_refund_no_exists", err.Error())
+	// 400 退款交易参数错误
 	case errors.Is(err, apprefund.ErrTransactionRequestNoRequired),
 		errors.Is(err, apprefund.ErrTransactionProviderRequired),
 		errors.Is(err, apprefund.ErrProviderRefundNoRequired),
@@ -561,6 +590,7 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 		errors.Is(err, apprefund.ErrTransactionStatusInvalid),
 		errors.Is(err, apprefund.ErrFailureReasonRequired):
 		writeError(writer, http.StatusBadRequest, "validation_failed", err.Error())
+	// 500 未知错误
 	default:
 		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 	}

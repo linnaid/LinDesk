@@ -33,7 +33,7 @@ func NewInMemoryRepository(orders []domain.Order) *InMemoryRepository {
 	}
 
 	for _, order := range orders {
-		repository.orders[order.ExternalOrderNo] = order
+		repository.orders[tenantKey(order.TenantID, order.ExternalOrderNo)] = order
 	}
 
 	return repository
@@ -45,6 +45,7 @@ func DemoOrders() []domain.Order {
 	return []domain.Order{
 		{
 			ID:                "order_1001",
+			TenantID:          "tenant_demo",
 			ExternalOrderNo:   "LD202608040001",
 			CustomerID:        "customer_1001",
 			PaymentStatus:     domain.PaymentStatusPaid,
@@ -56,6 +57,7 @@ func DemoOrders() []domain.Order {
 		},
 		{
 			ID:                "order_1002",
+			TenantID:          "tenant_demo",
 			ExternalOrderNo:   "LD202608040002",
 			CustomerID:        "customer_1002",
 			PaymentStatus:     domain.PaymentStatusPaid,
@@ -67,6 +69,7 @@ func DemoOrders() []domain.Order {
 		},
 		{
 			ID:                "order_1003",
+			TenantID:          "tenant_demo",
 			ExternalOrderNo:   "LD202608040003",
 			CustomerID:        "customer_1003",
 			PaymentStatus:     domain.PaymentStatusPending,
@@ -76,14 +79,26 @@ func DemoOrders() []domain.Order {
 			Currency:          "CNY",
 			PaidAt:            paidAt,
 		},
+		{
+			ID:                "order_acme_1001",
+			TenantID:          "tenant_acme",
+			ExternalOrderNo:   "LD202608040001",
+			CustomerID:        "customer_acme_1001",
+			PaymentStatus:     domain.PaymentStatusPaid,
+			FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+			PaidAmount:        25_900,
+			RefundedAmount:    0,
+			Currency:          "CNY",
+			PaidAt:            paidAt,
+		},
 	}
 }
 
-func (repository *InMemoryRepository) FindOrderByExternalOrderNo(_ context.Context, externalOrderNo string) (domain.Order, error) {
+func (repository *InMemoryRepository) FindOrderByExternalOrderNo(_ context.Context, tenantID string, externalOrderNo string) (domain.Order, error) {
 	repository.mutex.RLock()
 	defer repository.mutex.RUnlock()
 
-	order, ok := repository.orders[strings.TrimSpace(externalOrderNo)]
+	order, ok := repository.orders[tenantKey(tenantID, externalOrderNo)]
 	if !ok {
 		return domain.Order{}, ErrOrderNotFound
 	}
@@ -95,32 +110,33 @@ func (repository *InMemoryRepository) CreateRefundRequest(_ context.Context, req
 	repository.mutex.Lock()
 	defer repository.mutex.Unlock()
 
-	if _, exists := repository.requests[request.RequestNo]; exists {
+	key := tenantKey(request.TenantID, request.RequestNo)
+	if _, exists := repository.requests[key]; exists {
 		return fmt.Errorf("refund request %q already exists", request.RequestNo)
 	}
 
 	for _, existingRequest := range repository.requests {
-		if existingRequest.OrderID == request.OrderID && IsActiveStatus(existingRequest.Status) {
+		if existingRequest.TenantID == request.TenantID && existingRequest.OrderID == request.OrderID && IsActiveStatus(existingRequest.Status) {
 			return ErrActiveRefundRequestExists
 		}
 	}
 
-	repository.requests[request.RequestNo] = request
-	if _, exists := repository.approvals[request.RequestNo]; !exists {
-		repository.approvals[request.RequestNo] = nil
+	repository.requests[key] = request
+	if _, exists := repository.approvals[key]; !exists {
+		repository.approvals[key] = nil
 	}
-	if _, exists := repository.transactions[request.RequestNo]; !exists {
-		repository.transactions[request.RequestNo] = nil
+	if _, exists := repository.transactions[key]; !exists {
+		repository.transactions[key] = nil
 	}
 	repository.auditLogList = append(repository.auditLogList, auditLog)
 	return nil
 }
 
-func (repository *InMemoryRepository) FindRefundRequestByRequestNo(_ context.Context, requestNo string) (domain.RefundRequest, error) {
+func (repository *InMemoryRepository) FindRefundRequestByRequestNo(_ context.Context, tenantID string, requestNo string) (domain.RefundRequest, error) {
 	repository.mutex.RLock()
 	defer repository.mutex.RUnlock()
 
-	request, ok := repository.requests[strings.TrimSpace(requestNo)]
+	request, ok := repository.requests[tenantKey(tenantID, requestNo)]
 	if !ok {
 		return domain.RefundRequest{}, ErrRefundRequestNotFound
 	}
@@ -128,26 +144,27 @@ func (repository *InMemoryRepository) FindRefundRequestByRequestNo(_ context.Con
 	return request, nil
 }
 
-func (repository *InMemoryRepository) ListApprovalsByRequestNo(_ context.Context, requestNo string) ([]domain.Approval, error) {
+func (repository *InMemoryRepository) ListApprovalsByRequestNo(_ context.Context, tenantID string, requestNo string) ([]domain.Approval, error) {
 	repository.mutex.RLock()
 	defer repository.mutex.RUnlock()
 
-	if _, ok := repository.requests[strings.TrimSpace(requestNo)]; !ok {
+	key := tenantKey(tenantID, requestNo)
+	if _, ok := repository.requests[key]; !ok {
 		return nil, ErrRefundRequestNotFound
 	}
 
-	approvals := repository.approvals[strings.TrimSpace(requestNo)]
+	approvals := repository.approvals[key]
 	result := make([]domain.Approval, len(approvals))
 	copy(result, approvals)
 	return result, nil
 }
 
-func (repository *InMemoryRepository) ReviewRefundRequest(_ context.Context, requestNo string, approval domain.Approval, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
+func (repository *InMemoryRepository) ReviewRefundRequest(_ context.Context, tenantID string, requestNo string, approval domain.Approval, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
 	repository.mutex.Lock()
 	defer repository.mutex.Unlock()
 
-	requestNo = strings.TrimSpace(requestNo)
-	request, ok := repository.requests[requestNo]
+	key := tenantKey(tenantID, requestNo)
+	request, ok := repository.requests[key]
 	if !ok {
 		return domain.RefundRequest{}, ErrRefundRequestNotFound
 	}
@@ -157,34 +174,34 @@ func (repository *InMemoryRepository) ReviewRefundRequest(_ context.Context, req
 
 	request.Status = requestStatus
 	// 审核写入与状态更新、审计日志一起落下，模拟一次原子提交。
-	repository.requests[requestNo] = request
-	repository.approvals[requestNo] = append(repository.approvals[requestNo], approval)
+	repository.requests[key] = request
+	repository.approvals[key] = append(repository.approvals[key], approval)
 	repository.auditLogList = append(repository.auditLogList, auditLog)
 
 	return request, nil
 }
 
-func (repository *InMemoryRepository) ListRefundTransactionsByRequestNo(_ context.Context, requestNo string) ([]domain.RefundTransaction, error) {
+func (repository *InMemoryRepository) ListRefundTransactionsByRequestNo(_ context.Context, tenantID string, requestNo string) ([]domain.RefundTransaction, error) {
 	repository.mutex.RLock()
 	defer repository.mutex.RUnlock()
 
-	requestNo = strings.TrimSpace(requestNo)
-	if _, ok := repository.requests[requestNo]; !ok {
+	key := tenantKey(tenantID, requestNo)
+	if _, ok := repository.requests[key]; !ok {
 		return nil, ErrRefundRequestNotFound
 	}
 
-	transactions := repository.transactions[requestNo]
+	transactions := repository.transactions[key]
 	result := make([]domain.RefundTransaction, len(transactions))
 	copy(result, transactions)
 	return result, nil
 }
 
-func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
+func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
 	repository.mutex.Lock()
 	defer repository.mutex.Unlock()
 
-	requestNo = strings.TrimSpace(requestNo)
-	request, ok := repository.requests[requestNo]
+	key := tenantKey(tenantID, requestNo)
+	request, ok := repository.requests[key]
 	if !ok {
 		return domain.RefundRequest{}, ErrRefundRequestNotFound
 	}
@@ -192,18 +209,29 @@ func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context,
 		return domain.RefundRequest{}, ErrRefundRequestNotApproved
 	}
 	if transaction.ProviderRefundNo != "" {
-		if _, exists := repository.providerRefundNo[transaction.ProviderRefundNo]; exists {
+		providerKey := tenantProviderRefundKey(tenantID, transaction.Provider, transaction.ProviderRefundNo)
+		if _, exists := repository.providerRefundNo[providerKey]; exists {
 			return domain.RefundRequest{}, ErrProviderRefundNoExists
 		}
-		repository.providerRefundNo[transaction.ProviderRefundNo] = requestNo
+		repository.providerRefundNo[providerKey] = key
 	}
 
 	request.Status = requestStatus
-	repository.requests[requestNo] = request
-	repository.transactions[requestNo] = append(repository.transactions[requestNo], transaction)
+	repository.requests[key] = request
+	repository.transactions[key] = append(repository.transactions[key], transaction)
 	repository.auditLogList = append(repository.auditLogList, auditLog)
 
 	return request, nil
+}
+
+// 将租户ID和业务编号组合成一个Key
+func tenantKey(tenantID, businessNo string) string {
+	return strings.TrimSpace(tenantID) + "\x00" + strings.TrimSpace(businessNo)
+}
+
+// 生成 租户+支付渠道+渠道退款号 的复合唯一Key
+func tenantProviderRefundKey(tenantID, provider, providerRefundNo string) string {
+	return tenantKey(tenantID, strings.TrimSpace(provider)+"\x00"+strings.TrimSpace(providerRefundNo))
 }
 
 func (repository *InMemoryRepository) AuditLogs() []domain.AuditLog {

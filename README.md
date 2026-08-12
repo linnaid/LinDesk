@@ -22,6 +22,8 @@ migrations/         后续 PostgreSQL 迁移文件
 
 LinDesk 当前提供服务骨架、健康检查，以及基于内存数据的“未发货退款申请”首个业务纵切；暂不连接数据库或支付渠道。
 
+退款链路已经接入 demo 登录、RBAC 和租户数据隔离。业务接口会根据登录 token 中的租户身份查询订单和退款申请，不信任客户端伪造的业务 `tenant_id`。
+
 这只是第一个可验证闭环，后续会在同一平台上继续补齐售前咨询、订单操作和售后工单能力。
 
 ```bash
@@ -31,33 +33,47 @@ curl http://localhost:8080/healthz
 
 ## 首个业务模块
 
-本地启动后可使用内置演示订单验证退款申请流程：
+本地启动后先登录获取 demo token，再使用内置演示订单验证退款申请流程：
 
 ```bash
-curl http://localhost:8080/orders/LD202608040001
+CS_TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"cs@lindesk.local","password":"password123"}' | jq -r .token)
+
+SUPERVISOR_TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"supervisor@lindesk.local","password":"password123"}' | jq -r .token)
+
+FINANCE_TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"finance@lindesk.local","password":"password123"}' | jq -r .token)
+
+curl http://localhost:8080/orders/LD202608040001 \
+  -H "Authorization: Bearer $CS_TOKEN"
 
 curl -X POST http://localhost:8080/refund-requests \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $CS_TOKEN" \
   -d '{
     "external_order_no": "LD202608040001",
     "requested_amount": 12900,
     "reason_code": "CUSTOMER_CANCELLED",
-    "reason_note": "客户取消未发货订单",
-    "submitted_by": "user_cs_001"
+    "reason_note": "客户取消未发货订单"
   }'
 
-curl http://localhost:8080/refund-requests/RR202608040001
+curl http://localhost:8080/refund-requests/RR202608040001 \
+  -H "Authorization: Bearer $CS_TOKEN"
 
 curl -X POST http://localhost:8080/refund-requests/RR202608040001/approve \
   -H 'Content-Type: application/json' \
-  -H 'X-Actor-ID: user_supervisor_001' \
+  -H "Authorization: Bearer $SUPERVISOR_TOKEN" \
   -d '{
     "comment": "订单未发货，符合退款规则"
   }'
 
 curl -X POST http://localhost:8080/refund-requests/RR202608040001/refund-transactions \
   -H 'Content-Type: application/json' \
-  -H 'X-Actor-ID: user_finance_001' \
+  -H "Authorization: Bearer $FINANCE_TOKEN" \
   -d '{
     "provider": "alipay",
     "provider_refund_no": "ALI202608040001",
@@ -66,11 +82,10 @@ curl -X POST http://localhost:8080/refund-requests/RR202608040001/refund-transac
   }'
 ```
 
-内置演示订单：
+内置演示租户与订单：
 
-- `LD202608040001`：已支付、未发货，可创建退款申请。
-- `LD202608040002`：已支付、已发货，会被业务规则拒绝。
-- `LD202608040003`：未支付、未发货，会被业务规则拒绝。
+- `tenant_demo`：`LD202608040001` 已支付、未发货，可退 `12900`；`LD202608040002` 已发货；`LD202608040003` 未支付。
+- `tenant_acme`：也有 `LD202608040001`，但可退金额是 `25900`，用于验证相同外部订单号在不同租户下不会串数据。
 
 ## 当前进度
 

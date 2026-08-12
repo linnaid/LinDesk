@@ -14,6 +14,7 @@ import (
 var (
 	ErrOrderNotFound                = errors.New("order not found")
 	ErrRefundRequestNotFound        = errors.New("refund request not found")
+	ErrTenantRequired               = errors.New("tenant is required")
 	ErrExternalOrderNoRequired      = errors.New("external order number is required")
 	ErrRequestedAmountPositive      = errors.New("requested amount must be positive")
 	ErrReasonCodeRequired           = errors.New("reason code is required")
@@ -41,14 +42,14 @@ var (
 // Repository 定义退款闭环需要的持久化能力。
 // 当前用内存仓储支撑本地演示，后续可替换为 PostgreSQL。
 type Repository interface {
-	FindOrderByExternalOrderNo(ctx context.Context, externalOrderNo string) (domain.Order, error)
+	FindOrderByExternalOrderNo(ctx context.Context, tenantID string, externalOrderNo string) (domain.Order, error)
 	CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog) error
-	FindRefundRequestByRequestNo(ctx context.Context, requestNo string) (domain.RefundRequest, error)
+	FindRefundRequestByRequestNo(ctx context.Context, tenantID string, requestNo string) (domain.RefundRequest, error)
 	// 根据退款申请编号查询所有审批记录
-	ListApprovalsByRequestNo(ctx context.Context, requestNo string) ([]domain.Approval, error)
-	ListRefundTransactionsByRequestNo(ctx context.Context, requestNo string) ([]domain.RefundTransaction, error)
-	ReviewRefundRequest(ctx context.Context, requestNo string, approval domain.Approval, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
-	RecordRefundTransaction(ctx context.Context, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
+	ListApprovalsByRequestNo(ctx context.Context, tenantID string, requestNo string) ([]domain.Approval, error)
+	ListRefundTransactionsByRequestNo(ctx context.Context, tenantID string, requestNo string) ([]domain.RefundTransaction, error)
+	ReviewRefundRequest(ctx context.Context, tenantID string, requestNo string, approval domain.Approval, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
+	RecordRefundTransaction(ctx context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
 }
 
 type Clock interface {
@@ -62,24 +63,25 @@ func (SystemClock) Now() time.Time {
 }
 
 type RequestNumberGenerator interface {
-	Next(now time.Time) string
+	Next(tenantID string, now time.Time) string
 }
 
 type SequentialRequestNumberGenerator struct {
-	mutex    sync.Mutex
-	sequence int64
+	mutex            sync.Mutex
+	sequenceByTenant map[string]int64
 }
 
 func NewSequentialRequestNumberGenerator() *SequentialRequestNumberGenerator {
-	return &SequentialRequestNumberGenerator{}
+	return &SequentialRequestNumberGenerator{sequenceByTenant: make(map[string]int64)}
 }
 
-func (generator *SequentialRequestNumberGenerator) Next(now time.Time) string {
+func (generator *SequentialRequestNumberGenerator) Next(tenantID string, now time.Time) string {
 	generator.mutex.Lock()
 	defer generator.mutex.Unlock()
 
-	generator.sequence++
-	return fmt.Sprintf("RR%s%04d", now.UTC().Format("20060102"), generator.sequence)
+	tenantID = strings.TrimSpace(tenantID)
+	generator.sequenceByTenant[tenantID]++
+	return fmt.Sprintf("RR%s%04d", now.UTC().Format("20060102"), generator.sequenceByTenant[tenantID])
 }
 
 type Service struct {
@@ -109,6 +111,7 @@ func NewService(repository Repository, highAmountApprovalThreshold int64, clock 
 }
 
 type CreateRequestCommand struct {
+	TenantID        string
 	ExternalOrderNo string
 	RequestedAmount int64
 	ReasonCode      string
@@ -126,6 +129,7 @@ type RequestDetail struct {
 
 // ReviewRequestCommand 只表达业务输入，不承载登录态；当前操作者由上层鉴权层注入。
 type ReviewRequestCommand struct {
+	TenantID   string
 	RequestNo  string
 	DecisionBy string
 	Comment    string
@@ -137,6 +141,7 @@ type ReviewResult struct {
 }
 
 type RecordTransactionCommand struct {
+	TenantID         string
 	RequestNo        string
 	Provider         string
 	ProviderRefundNo string
@@ -147,26 +152,34 @@ type RecordTransactionCommand struct {
 }
 
 type TransactionResult struct {
-	Request     RequestDetail				// 最新退款申请详情
-	Transaction domain.RefundTransaction	// 本次退款交易记录
+	Request     RequestDetail            // 最新退款申请详情
+	Transaction domain.RefundTransaction // 本次退款交易记录
 }
 
-func (service *Service) GetOrder(ctx context.Context, externalOrderNo string) (domain.Order, error) {
+func (service *Service) GetOrder(ctx context.Context, tenantID string, externalOrderNo string) (domain.Order, error) {
+	tenantID = strings.TrimSpace(tenantID)
 	externalOrderNo = strings.TrimSpace(externalOrderNo)
+	if tenantID == "" {
+		return domain.Order{}, ErrTenantRequired
+	}
 	if externalOrderNo == "" {
 		return domain.Order{}, ErrExternalOrderNoRequired
 	}
 
-	return service.repository.FindOrderByExternalOrderNo(ctx, externalOrderNo)
+	return service.repository.FindOrderByExternalOrderNo(ctx, tenantID, externalOrderNo)
 }
 
 // CreateRequest 先校验订单资格，再固化订单快照并进入待审状态。
 func (service *Service) CreateRequest(ctx context.Context, command CreateRequestCommand) (RequestDetail, error) {
+	command.TenantID = strings.TrimSpace(command.TenantID)
 	command.ExternalOrderNo = strings.TrimSpace(command.ExternalOrderNo)
 	command.ReasonCode = strings.TrimSpace(command.ReasonCode)
 	command.ReasonNote = strings.TrimSpace(command.ReasonNote)
 	command.SubmittedBy = strings.TrimSpace(command.SubmittedBy)
 
+	if command.TenantID == "" {
+		return RequestDetail{}, ErrTenantRequired
+	}
 	if command.ExternalOrderNo == "" {
 		return RequestDetail{}, ErrExternalOrderNoRequired
 	}
@@ -180,7 +193,7 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 		return RequestDetail{}, ErrSubmittedByRequired
 	}
 
-	order, err := service.repository.FindOrderByExternalOrderNo(ctx, command.ExternalOrderNo)
+	order, err := service.repository.FindOrderByExternalOrderNo(ctx, command.TenantID, command.ExternalOrderNo)
 	if err != nil {
 		return RequestDetail{}, err
 	}
@@ -192,9 +205,10 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 	}
 
 	now := service.clock.Now().UTC()
-	requestNo := service.requestNumbers.Next(now)
+	requestNo := service.requestNumbers.Next(command.TenantID, now)
 	request := domain.RefundRequest{
-		ID:              "refund_" + requestNo,
+		ID:              "refund_" + command.TenantID + "_" + requestNo,
+		TenantID:        command.TenantID,
 		RequestNo:       requestNo,
 		OrderID:         order.ID,
 		OrderSnapshot:   order,
@@ -206,7 +220,8 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 		SubmittedAt:     now,
 	}
 	auditLog := domain.AuditLog{
-		ID:         "audit_" + requestNo,
+		ID:         "audit_" + command.TenantID + "_" + requestNo,
+		TenantID:   command.TenantID,
 		EntityType: "refund_request",
 		EntityID:   request.ID,
 		Action:     "refund_request.created",
@@ -228,13 +243,17 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 	return service.detail(ctx, request)
 }
 
-func (service *Service) GetRequest(ctx context.Context, requestNo string) (RequestDetail, error) {
+func (service *Service) GetRequest(ctx context.Context, tenantID string, requestNo string) (RequestDetail, error) {
+	tenantID = strings.TrimSpace(tenantID)
 	requestNo = strings.TrimSpace(requestNo)
+	if tenantID == "" {
+		return RequestDetail{}, ErrTenantRequired
+	}
 	if requestNo == "" {
 		return RequestDetail{}, ErrRefundRequestNotFound
 	}
 
-	request, err := service.repository.FindRefundRequestByRequestNo(ctx, requestNo)
+	request, err := service.repository.FindRefundRequestByRequestNo(ctx, tenantID, requestNo)
 	if err != nil {
 		return RequestDetail{}, err
 	}
@@ -252,12 +271,16 @@ func (service *Service) RejectRequest(ctx context.Context, command ReviewRequest
 
 // RecordTransaction 记录财务人工退款结果；只有已审批通过的申请才能结案。
 func (service *Service) RecordTransaction(ctx context.Context, command RecordTransactionCommand) (TransactionResult, error) {
+	command.TenantID = strings.TrimSpace(command.TenantID)
 	command.RequestNo = strings.TrimSpace(command.RequestNo)
 	command.Provider = strings.TrimSpace(command.Provider)
 	command.ProviderRefundNo = strings.TrimSpace(command.ProviderRefundNo)
 	command.FailureReason = strings.TrimSpace(command.FailureReason)
 	command.ProcessedBy = strings.TrimSpace(command.ProcessedBy)
 
+	if command.TenantID == "" {
+		return TransactionResult{}, ErrTenantRequired
+	}
 	if command.RequestNo == "" {
 		return TransactionResult{}, ErrTransactionRequestNoRequired
 	}
@@ -280,7 +303,7 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		return TransactionResult{}, ErrFailureReasonRequired
 	}
 
-	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.RequestNo)
+	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.TenantID, command.RequestNo)
 	if err != nil {
 		return TransactionResult{}, err
 	}
@@ -293,7 +316,8 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 
 	now := service.clock.Now().UTC()
 	transaction := domain.RefundTransaction{
-		ID:               "transaction_" + request.RequestNo + "_" + strings.ToLower(string(command.Status)),
+		ID:               "transaction_" + command.TenantID + "_" + request.RequestNo + "_" + strings.ToLower(string(command.Status)),
+		TenantID:         command.TenantID,
 		RefundRequestID:  request.ID,
 		Provider:         command.Provider,
 		ProviderRefundNo: command.ProviderRefundNo,
@@ -311,7 +335,8 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		action = "refund_request.refund_failed"
 	}
 	auditLog := domain.AuditLog{
-		ID:         "audit_" + request.RequestNo + "_" + string(command.Status),
+		ID:         "audit_" + command.TenantID + "_" + request.RequestNo + "_" + string(command.Status),
+		TenantID:   command.TenantID,
 		EntityType: "refund_request",
 		EntityID:   request.ID,
 		Action:     action,
@@ -332,7 +357,7 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		CreatedAt: now,
 	}
 
-	updatedRequest, err := service.repository.RecordRefundTransaction(ctx, request.RequestNo, transaction, requestStatus, auditLog)
+	updatedRequest, err := service.repository.RecordRefundTransaction(ctx, command.TenantID, request.RequestNo, transaction, requestStatus, auditLog)
 	if err != nil {
 		return TransactionResult{}, err
 	}
@@ -347,10 +372,14 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 
 // reviewRequest 让通过和驳回共享同一套校验，避免重复处理审批人、状态和备注。
 func (service *Service) reviewRequest(ctx context.Context, command ReviewRequestCommand, approvalStatus domain.ApprovalStatus, requestStatus domain.RefundRequestStatus) (ReviewResult, error) {
+	command.TenantID = strings.TrimSpace(command.TenantID)
 	command.RequestNo = strings.TrimSpace(command.RequestNo)
 	command.DecisionBy = strings.TrimSpace(command.DecisionBy)
 	command.Comment = strings.TrimSpace(command.Comment)
 
+	if command.TenantID == "" {
+		return ReviewResult{}, ErrTenantRequired
+	}
 	if command.RequestNo == "" {
 		return ReviewResult{}, ErrReviewRequestNoRequired
 	}
@@ -361,7 +390,7 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 		return ReviewResult{}, ErrApprovalCommentRequired
 	}
 
-	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.RequestNo)
+	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.TenantID, command.RequestNo)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -374,7 +403,8 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 
 	now := service.clock.Now().UTC()
 	approval := domain.Approval{
-		ID:              "approval_" + request.RequestNo + "_1",
+		ID:              "approval_" + command.TenantID + "_" + request.RequestNo + "_1",
+		TenantID:        command.TenantID,
 		RefundRequestID: request.ID,
 		Level:           1,
 		Status:          approvalStatus,
@@ -384,7 +414,8 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 		Comment:         command.Comment,
 	}
 	auditLog := domain.AuditLog{
-		ID:         "audit_" + request.RequestNo + "_" + string(approvalStatus),
+		ID:         "audit_" + command.TenantID + "_" + request.RequestNo + "_" + string(approvalStatus),
+		TenantID:   command.TenantID,
 		EntityType: "refund_request",
 		EntityID:   request.ID,
 		Action:     "refund_request." + strings.ToLower(string(approvalStatus)),
@@ -402,7 +433,7 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 		CreatedAt: now,
 	}
 
-	updatedRequest, err := service.repository.ReviewRefundRequest(ctx, request.RequestNo, approval, requestStatus, auditLog)
+	updatedRequest, err := service.repository.ReviewRefundRequest(ctx, command.TenantID, request.RequestNo, approval, requestStatus, auditLog)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -417,11 +448,11 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 
 // detail 查询时把审批记录一并带回，方便前端渲染完整时间线。
 func (service *Service) detail(ctx context.Context, request domain.RefundRequest) (RequestDetail, error) {
-	approvals, err := service.repository.ListApprovalsByRequestNo(ctx, request.RequestNo)
+	approvals, err := service.repository.ListApprovalsByRequestNo(ctx, request.TenantID, request.RequestNo)
 	if err != nil {
 		return RequestDetail{}, err
 	}
-	transactions, err := service.repository.ListRefundTransactionsByRequestNo(ctx, request.RequestNo)
+	transactions, err := service.repository.ListRefundTransactionsByRequestNo(ctx, request.TenantID, request.RequestNo)
 	if err != nil {
 		return RequestDetail{}, err
 	}
