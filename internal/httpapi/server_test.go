@@ -263,6 +263,27 @@ func TestProtectedRouteRejectsMissingToken(t *testing.T) {
 	}
 }
 
+func TestLogoutRevokesBearerToken(t *testing.T) {
+	handler := newSecureTestHandler()
+	token := loginToken(t, handler, "cs@lindesk.local")
+
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logoutRequest.Header.Set("Authorization", "Bearer "+token)
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, logoutRequest)
+	if logoutResponse.Code != http.StatusOK {
+		t.Fatalf("logout status = %d, want %d, body = %s", logoutResponse.Code, http.StatusOK, logoutResponse.Body.String())
+	}
+
+	orderRequest := httptest.NewRequest(http.MethodGet, "/orders/LD202608040001", nil)
+	orderRequest.Header.Set("Authorization", "Bearer "+token)
+	orderResponse := httptest.NewRecorder()
+	handler.ServeHTTP(orderResponse, orderRequest)
+	if orderResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("order status = %d, want %d", orderResponse.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestSecureRefundRequestsAreTenantIsolated(t *testing.T) {
 	handler := newSecureTestHandler()
 	demoToken := loginToken(t, handler, "cs@lindesk.local")
