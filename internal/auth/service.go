@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ var (
 	ErrTenantNotFound      = errors.New("tenant not found")
 	ErrTokenRequired       = errors.New("authorization token is required")
 	ErrInvalidToken        = errors.New("authorization token is invalid")
+	ErrSessionExpired      = errors.New("authorization session is expired")	// Session 已过期
 	ErrPermissionDenied    = errors.New("permission denied")
 	ErrNoActiveMembership  = errors.New("user has no active tenant membership") // 没有租户关系
 	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户歧义
@@ -35,9 +38,14 @@ type LoginCommand struct {
 
 // 一个已经登陆成功的用户会话
 type Session struct {
-	Token     string // 身份凭证
+	Token     string // 身份凭证 只在登录响应中返回，不持久化到服务端 session map
 	Actor     domain.Actor
 	ExpiresAt time.Time // 过期时间
+}
+
+type storedSession struct {
+	Actor     domain.Actor
+	ExpiresAt time.Time
 }
 
 // Service 是当前阶段的身份服务，负责登录、解析 token 和权限判断。
@@ -49,7 +57,7 @@ type Service struct {
 	userByEmail map[string]domain.User
 	roleByCode  map[domain.RoleCode]domain.Role // 角色表
 	memberships []domain.TenantMember           // 用户属于哪些租户
-	sessions    map[string]Session              // 保存登陆状态
+	sessions    map[string]storedSession        // 按 token hash 保存登陆状态
 	now         func() time.Time
 }
 
@@ -64,7 +72,7 @@ func NewService(tenants []domain.Tenant, users []domain.User, roles []domain.Rol
 		userByEmail: make(map[string]domain.User, len(users)),
 		roleByCode:  make(map[domain.RoleCode]domain.Role, len(roles)),
 		memberships: append([]domain.TenantMember(nil), memberships...),
-		sessions:    make(map[string]Session),
+		sessions:    make(map[string]storedSession),
 		now:         now,
 	}
 
@@ -115,17 +123,20 @@ func (service *Service) Login(_ context.Context, command LoginCommand) (Session,
 		return Session{}, err
 	}
 
-	// 后续修改点---------------------
-	// token 生成方式有风险不够安全
-	// 后续考虑修改成 crypto/rand 生成不可预测的随机 access token
-	// 数据库或 Redis 只保存 token 哈希；增加短期 access token、可轮换 refresh token、注销和撤销机制
-	token := "demo_token_" + actor.Tenant.ID + "_" + actor.User.ID
+	token, err := NewAccessToken()
+	if err != nil {
+		return Session{}, err
+	}
+	expiresAt := service.now().Add(8 * time.Hour)
 	session := Session{
 		Token:     token,
 		Actor:     actor,
-		ExpiresAt: service.now().Add(8 * time.Hour),
+		ExpiresAt: expiresAt,
 	}
-	service.sessions[token] = session
+	service.sessions[TokenHash(token)] = storedSession{
+		Actor:     actor,
+		ExpiresAt: expiresAt,
+	}
 
 	return session, nil
 }
@@ -140,12 +151,28 @@ func (service *Service) Authenticate(_ context.Context, token string) (domain.Ac
 	service.mutex.RLock()
 	defer service.mutex.RUnlock()
 
-	session, ok := service.sessions[token]
-	if !ok || service.now().After(session.ExpiresAt) {
+	session, ok := service.sessions[TokenHash(token)]
+	if !ok {
 		return domain.Actor{}, ErrInvalidToken
+	}
+	if service.now().After(session.ExpiresAt) {
+		return domain.Actor{}, ErrSessionExpired
 	}
 
 	return session.Actor, nil
+}
+
+func (service *Service) Logout(_ context.Context, token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ErrTokenRequired
+	}
+
+	service.mutex.Lock()
+	defer service.mutex.Unlock()
+
+	delete(service.sessions, TokenHash(token))
+	return nil
 }
 
 // 检查当前用户是否拥有执行某个操作的权限
@@ -217,6 +244,21 @@ func hasMultipleTenants(memberships []domain.TenantMember) bool {
 // 目前将密码经过 SHA-256 哈希处理，不是生产级别密码方案
 func HashPassword(password string) string {
 	sum := sha256.Sum256([]byte("lindesk-demo:" + password))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func NewAccessToken() (string, error) {
+	buffer := make([]byte, 32)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+
+	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+// 返回 token 的 SHA-256哈希
+func TokenHash(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 

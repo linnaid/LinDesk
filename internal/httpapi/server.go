@@ -44,6 +44,7 @@ func NewHandler(serviceName, version string, dependencies ...Dependencies) http.
 	})
 	if deps.Auth != nil {
 		mux.HandleFunc("POST /auth/login", handleLogin(deps.Auth))
+		mux.HandleFunc("POST /auth/logout", handleLogout(deps.Auth))
 	}
 	if deps.Refunds != nil {
 		mux.HandleFunc("GET /orders/{external_order_no}", requirePermission(deps.Auth, domain.PermissionOrderRead, handleGetOrder(deps.Refunds)))
@@ -97,6 +98,17 @@ func handleLogin(auths *auth.Service) http.HandlerFunc {
 			ExpiresAt: session.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 			Actor:     newActorResponse(session.Actor),
 		})
+	}
+}
+
+func handleLogout(auths *auth.Service) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if err := auths.Logout(request.Context(), bearerToken(request.Header.Get("Authorization"))); err != nil {
+			writeAuthError(writer, err)
+			return
+		}
+
+		writeJSON(writer, http.StatusOK, map[string]string{"status": "logged_out"})
 	}
 }
 
@@ -527,20 +539,27 @@ func writeJSON(writer http.ResponseWriter, status int, payload any) {
 
 func writeAuthError(writer http.ResponseWriter, err error) {
 	switch {
+	// 400 请求参数缺失或格式不满足认证接口要求
 	case errors.Is(err, auth.ErrEmailRequired),
 		errors.Is(err, auth.ErrPasswordRequired),
 		errors.Is(err, auth.ErrTenantRequired):
 		writeError(writer, http.StatusBadRequest, "validation_failed", err.Error())
+	// 401 请求未通过身份认证，或认证凭证缺失、无效、已过期
 	case errors.Is(err, auth.ErrInvalidCredentials),
 		errors.Is(err, auth.ErrInvalidToken),
+		errors.Is(err, auth.ErrSessionExpired),
 		errors.Is(err, auth.ErrTokenRequired):
 		writeError(writer, http.StatusUnauthorized, "unauthorized", err.Error())
+	// 403 当前用户无法确定或访问有效的租户上下文
+	// 为避免暴露租户存在性及成员关系，对外统一返回 403 Forbidden
 	case errors.Is(err, auth.ErrTenantNotFound),
 		errors.Is(err, auth.ErrNoActiveMembership),
 		errors.Is(err, auth.ErrAmbiguousMembership):
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	// 403 用户已完成身份认证，但缺少执行当前操作所需的权限
 	case errors.Is(err, auth.ErrPermissionDenied):
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	// 500 未知错误
 	default:
 		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
 	}
