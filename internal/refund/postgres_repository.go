@@ -60,7 +60,7 @@ LIMIT 1
 		if err == nil {
 			return ErrActiveRefundRequestExists
 		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 
