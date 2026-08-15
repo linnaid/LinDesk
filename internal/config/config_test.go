@@ -9,6 +9,7 @@ import (
 
 func TestLoadUsesDefaults(t *testing.T) {
 	t.Setenv("LINDESK_HTTP_ADDR", "")
+	t.Setenv("LINDESK_DATABASE_DRIVER", "")
 	t.Setenv("LINDESK_DATABASE_DSN", "")
 	t.Setenv("LINDESK_HIGH_AMOUNT_APPROVAL_THRESHOLD", "")
 
@@ -47,6 +48,7 @@ func TestLoadAppliesFileAndEnvironmentOverrides(t *testing.T) {
 	}
 
 	t.Setenv("LINDESK_HTTP_ADDR", ":9090")
+	t.Setenv("LINDESK_DATABASE_DRIVER", "memory")
 	t.Setenv("LINDESK_DATABASE_DSN", "postgres://from-env")
 	t.Setenv("LINDESK_HIGH_AMOUNT_APPROVAL_THRESHOLD", "70000")
 
@@ -60,6 +62,9 @@ func TestLoadAppliesFileAndEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.Database.DSN != "postgres://from-env" {
 		t.Fatalf("DSN = %q, want environment value", cfg.Database.DSN)
+	}
+	if cfg.Database.Driver != "memory" {
+		t.Fatalf("Driver = %q, want memory", cfg.Database.Driver)
 	}
 	if cfg.Refund.HighAmountApprovalThreshold != 70_000 {
 		t.Fatalf("HighAmountApprovalThreshold = %d, want 70000", cfg.Refund.HighAmountApprovalThreshold)

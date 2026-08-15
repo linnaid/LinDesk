@@ -103,8 +103,11 @@ go run ./cmd/lindesk -config configs/local.json
 支持通过环境变量覆盖本地配置中的非敏感项：
 
 - `LINDESK_HTTP_ADDR`
+- `LINDESK_DATABASE_DRIVER`
 - `LINDESK_DATABASE_DSN`
 - `LINDESK_HIGH_AMOUNT_APPROVAL_THRESHOLD`
+
+当前阶段服务启动时会尝试探测 PostgreSQL 连接；如果未配置 DSN 或连接不可用，会记录日志并继续使用内存仓储。连接成功时，退款链路会使用 PostgreSQL 仓储；请先执行 `migrations/` 下的 schema，并准备租户、用户、成员、订单等基础数据。
 
 ## 验证
 

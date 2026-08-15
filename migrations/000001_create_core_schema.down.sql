@@ -7,6 +7,7 @@ DROP INDEX IF EXISTS approvals_tenant_id_idx;
 DROP INDEX IF EXISTS refund_requests_tenant_id_idx;
 DROP INDEX IF EXISTS orders_tenant_id_idx;
 DROP INDEX IF EXISTS refund_transactions_provider_refund_no_unique_idx;
+DROP INDEX IF EXISTS refund_requests_active_order_unique_idx;
 
 DROP TABLE IF EXISTS audit_logs;
 DROP TABLE IF EXISTS refund_transactions;

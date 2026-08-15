@@ -79,6 +79,9 @@ func Load(path string) (Config, error) {
 	if value, ok := os.LookupEnv("LINDESK_HTTP_ADDR"); ok && strings.TrimSpace(value) != "" {
 		cfg.Service.HTTPAddr = value
 	}
+	if value, ok := os.LookupEnv("LINDESK_DATABASE_DRIVER"); ok && strings.TrimSpace(value) != "" {
+		cfg.Database.Driver = value
+	}
 	if value, ok := os.LookupEnv("LINDESK_DATABASE_DSN"); ok && strings.TrimSpace(value) != "" {
 		cfg.Database.DSN = value
 	}

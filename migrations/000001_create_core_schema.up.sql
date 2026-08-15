@@ -90,6 +90,11 @@ CREATE TABLE refund_requests (
     UNIQUE (tenant_id, id)
 );
 
+-- 同一租户、同一订单只能有一条进行中的退款申请，防止并发重复提交。
+CREATE UNIQUE INDEX refund_requests_active_order_unique_idx
+ON refund_requests (tenant_id, order_id)
+WHERE status IN ('PENDING_REVIEW', 'APPROVED', 'PROCESSING');
+
 CREATE TABLE approvals (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
@@ -113,6 +118,7 @@ CREATE TABLE approvals (
     UNIQUE (tenant_id, refund_request_id, level)
 );
 
+-- 财务退款回填表
 CREATE TABLE refund_transactions (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
