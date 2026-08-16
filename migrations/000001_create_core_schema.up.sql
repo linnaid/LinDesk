@@ -1,5 +1,5 @@
 -- LinDesk 核心多租户 schema。
--- 这版 migration 只建立数据库结构和约束，演示基础数据由 000002 seed migration 提供。
+-- 这版 migration 只建立数据库结构和约束，演示基础数据由 scripts/seeds 提供。
 
 CREATE TABLE tenants (
     id TEXT PRIMARY KEY,

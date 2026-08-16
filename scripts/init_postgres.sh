@@ -22,11 +22,11 @@ run_sql_file() {
 }
 
 if [[ "${1:-}" == "--reset" ]]; then
-  run_sql_file "$repo_root/migrations/000002_seed_demo_data.down.sql"
+  run_sql_file "$repo_root/scripts/seeds/demo_data.down.sql"
   run_sql_file "$repo_root/migrations/000001_create_core_schema.down.sql"
 fi
 
 run_sql_file "$repo_root/migrations/000001_create_core_schema.up.sql"
-run_sql_file "$repo_root/migrations/000002_seed_demo_data.up.sql"
+run_sql_file "$repo_root/scripts/seeds/demo_data.up.sql"
 
 echo "PostgreSQL schema and demo data are ready."

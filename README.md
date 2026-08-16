@@ -15,8 +15,8 @@ docs/               产品与技术文档
 internal/config/    配置加载与校验
 internal/domain/    订单、退款、审核、审计领域模型
 internal/httpapi/   HTTP 路由与基础探针
-migrations/         PostgreSQL schema 与本地演示 seed
-scripts/            本地初始化脚本
+migrations/         PostgreSQL schema 迁移
+scripts/            本地初始化脚本与演示 seed
 ```
 
 ## 本地启动
@@ -94,7 +94,7 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 
 - 已完成：订单查询、退款申请创建、退款审核通过/驳回、财务人工退款回填、成功/失败结案。
 - 已完成：demo 登录、Bearer Token、RBAC 权限校验和租户数据隔离。
-- 已完成：PostgreSQL 退款仓储、核心 schema、演示 seed 和本地初始化脚本。
+- 已完成：PostgreSQL 退款仓储、核心 schema、本地演示 seed 和初始化脚本。
 - 下一步：把 Auth 从内存 demo 升级为 PostgreSQL 持久化，或继续扩展订单/工单数据模型。
 
 如需使用本地配置文件：
@@ -127,7 +127,7 @@ go run ./cmd/lindesk -config configs/local.json
 说明：
 
 - `docker-compose.yml` 启动本地 PostgreSQL，并创建 `lindesk` 数据库和用户。
-- `scripts/init_postgres.sh --reset` 会重建本地 schema，并写入 demo 租户、用户、角色、成员和订单。
+- `scripts/init_postgres.sh --reset` 会重建本地 schema，并执行 `scripts/seeds/` 下的 demo seed。
 - `configs/local.example.json` 的 DSN 与 compose 默认账号一致。
 - Auth 当前仍使用内存 Demo Service；seed 中的用户和成员用于满足 PostgreSQL 外键约束，后续会升级为数据库 Auth。
 
