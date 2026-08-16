@@ -1,0 +1,20 @@
+# 启动一个 PostgreSQL 16 数据库
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: lindesk
+      POSTGRES_USER: lindesk
+      POSTGRES_PASSWORD: lindesk
+    ports:
+      - "5432:5432"
+    volumes:
+      - lindesk-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lindesk -d lindesk"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  lindesk-postgres-data:
