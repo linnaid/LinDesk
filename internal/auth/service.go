@@ -24,11 +24,18 @@ var (
 	ErrTenantNotFound      = errors.New("tenant not found")
 	ErrTokenRequired       = errors.New("authorization token is required")
 	ErrInvalidToken        = errors.New("authorization token is invalid")
-	ErrSessionExpired      = errors.New("authorization session is expired")	// Session 已过期
+	ErrSessionExpired      = errors.New("authorization session is expired") // Session 已过期
 	ErrPermissionDenied    = errors.New("permission denied")
 	ErrNoActiveMembership  = errors.New("user has no active tenant membership") // 没有租户关系
 	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户歧义
 )
+
+// 认证必须提供哪些能力
+type Authenticator interface {
+	Login(context.Context, LoginCommand) (Session, error)
+	Authenticate(context.Context, string) (domain.Actor, error)
+	Logout(context.Context, string) error
+}
 
 type LoginCommand struct {
 	Email    string
@@ -60,6 +67,8 @@ type Service struct {
 	sessions    map[string]storedSession        // 按 token hash 保存登陆状态
 	now         func() time.Time
 }
+
+var _ Authenticator = (*Service)(nil)
 
 func NewService(tenants []domain.Tenant, users []domain.User, roles []domain.Role, memberships []domain.TenantMember, now func() time.Time) *Service {
 	if now == nil {
@@ -114,7 +123,7 @@ func (service *Service) Login(_ context.Context, command LoginCommand) (Session,
 	defer service.mutex.Unlock()
 
 	user, ok := service.userByEmail[command.Email]
-	if !ok || user.Status != domain.UserStatusActive || user.PasswordHash != HashPassword(command.Password) {
+	if !ok || user.Status != domain.UserStatusActive || !VerifyPassword(user.PasswordHash, command.Password) {
 		return Session{}, ErrInvalidCredentials
 	}
 
@@ -127,7 +136,7 @@ func (service *Service) Login(_ context.Context, command LoginCommand) (Session,
 	if err != nil {
 		return Session{}, err
 	}
-	expiresAt := service.now().Add(8 * time.Hour)
+	expiresAt := service.now().Add(sessionTTL)
 	session := Session{
 		Token:     token,
 		Actor:     actor,
@@ -155,7 +164,7 @@ func (service *Service) Authenticate(_ context.Context, token string) (domain.Ac
 	if !ok {
 		return domain.Actor{}, ErrInvalidToken
 	}
-	if service.now().After(session.ExpiresAt) {
+	if !service.now().Before(session.ExpiresAt) {
 		return domain.Actor{}, ErrSessionExpired
 	}
 
@@ -240,13 +249,6 @@ func hasMultipleTenants(memberships []domain.TenantMember) bool {
 	return false
 }
 
-// 后续修改点--------------------------
-// 目前将密码经过 SHA-256 哈希处理，不是生产级别密码方案
-func HashPassword(password string) string {
-	sum := sha256.Sum256([]byte("lindesk-demo:" + password))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
 func NewAccessToken() (string, error) {
 	buffer := make([]byte, 32)
 	if _, err := rand.Read(buffer); err != nil {
@@ -270,7 +272,7 @@ func DemoTenants(now time.Time) []domain.Tenant {
 }
 
 func DemoUsers(now time.Time) []domain.User {
-	passwordHash := HashPassword("password123")
+	passwordHash := demoPasswordHash
 
 	return []domain.User{
 		{ID: "user_cs_001", Name: "客服一号", Email: "cs@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},

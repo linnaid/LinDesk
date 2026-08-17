@@ -14,6 +14,7 @@ import (
 
 	"lindesk/internal/auth"
 	"lindesk/internal/config"
+	"lindesk/internal/database"
 	"lindesk/internal/httpapi"
 	"lindesk/internal/refund"
 )
@@ -31,14 +32,44 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
-	refundRepository := refund.NewInMemoryRepository(refund.DemoOrders())
+	databaseContext, cancelDatabaseContext := context.WithTimeout(context.Background(), 3*time.Second)
+	databaseHandle, err := database.Open(databaseContext, cfg.Database)
+	cancelDatabaseContext()
+	if err != nil {
+		if database.IsDisabled(err) {
+			logger.Info("Database connection disabled; using in-memory repositories", "driver", cfg.Database.Driver)
+		} else {
+			logger.Warn("Database connection unavailable; using in-memory repositories", "driver", cfg.Database.Driver, "error", err)
+		}
+	} else {
+		defer databaseHandle.Close()
+		logger.Info("Database connection ready", "driver", cfg.Database.Driver)
+	}
+
+	var refundRepository refund.Repository
+	if databaseHandle != nil {
+		refundRepository = refund.NewPostgresRepository(databaseHandle)
+		logger.Info("Using PostgreSQL refund repository")
+	} else {
+		refundRepository = refund.NewInMemoryRepository(refund.DemoOrders())
+		logger.Info("Using in-memory refund repository")
+	}
+
 	refundService := refund.NewService(
 		refundRepository,
 		cfg.Refund.HighAmountApprovalThreshold,
 		refund.SystemClock{},
 		refund.NewSequentialRequestNumberGenerator(),
 	)
-	authService := auth.NewDemoService()
+	var authService auth.Authenticator
+	if databaseHandle != nil {
+		authService = auth.NewPostgresService(databaseHandle)
+		logger.Info("Using PostgreSQL auth service")
+	} else {
+		authService = auth.NewDemoService()
+		logger.Info("Using in-memory auth service")
+	}
+
 	server := httpapi.NewServer(cfg.Service.HTTPAddr, cfg.Service.Name, version, httpapi.Dependencies{
 		Refunds: refundService,
 		Auth:    authService,

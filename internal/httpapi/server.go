@@ -14,7 +14,7 @@ import (
 
 type Dependencies struct {
 	Refunds *apprefund.Service
-	Auth    *auth.Service
+	Auth    auth.Authenticator
 }
 
 type actorContextKey struct{}
@@ -66,7 +66,7 @@ func resolveDependencies(dependencies []Dependencies) Dependencies {
 	return dependencies[0]
 }
 
-func handleLogin(auths *auth.Service) http.HandlerFunc {
+func handleLogin(auths auth.Authenticator) http.HandlerFunc {
 	type payload struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -101,7 +101,7 @@ func handleLogin(auths *auth.Service) http.HandlerFunc {
 	}
 }
 
-func handleLogout(auths *auth.Service) http.HandlerFunc {
+func handleLogout(auths auth.Authenticator) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		if err := auths.Logout(request.Context(), bearerToken(request.Header.Get("Authorization"))); err != nil {
 			writeAuthError(writer, err)
@@ -114,7 +114,7 @@ func handleLogout(auths *auth.Service) http.HandlerFunc {
 
 // 为 HTTP handler 添加认证和权限校验
 // 只有当前用户已登录且拥有指定权限时，才会执行被包装的 handler
-func requirePermission(auths *auth.Service, permission domain.Permission, next http.HandlerFunc) http.HandlerFunc {
+func requirePermission(auths auth.Authenticator, permission domain.Permission, next http.HandlerFunc) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		if auths == nil {
 			next(writer, request)

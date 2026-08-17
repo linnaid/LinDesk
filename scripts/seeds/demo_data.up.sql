@@ -9,13 +9,13 @@ ON CONFLICT (id) DO UPDATE SET
     status = EXCLUDED.status;
 
 INSERT INTO users (id, name, email, password_hash, status, created_at) VALUES
-    ('user_cs_001', '客服一号', 'cs@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_supervisor_001', '主管一号', 'supervisor@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_finance_001', '财务一号', 'finance@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_admin_001', '管理员一号', 'admin@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_acme_cs_001', 'Acme 客服一号', 'acme.cs@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_acme_supervisor_001', 'Acme 主管一号', 'acme.supervisor@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z'),
-    ('user_acme_finance_001', 'Acme 财务一号', 'acme.finance@lindesk.local', 'sha256:5e82c19c3ab61680865c92a9ad7e11a827e6f9b55aaec0a3e18c0418cc4745a0', 'ACTIVE', '2026-08-06T00:00:00Z')
+    ('user_cs_001', '客服一号', 'cs@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_supervisor_001', '主管一号', 'supervisor@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_finance_001', '财务一号', 'finance@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_admin_001', '管理员一号', 'admin@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_acme_cs_001', 'Acme 客服一号', 'acme.cs@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_acme_supervisor_001', 'Acme 主管一号', 'acme.supervisor@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z'),
+    ('user_acme_finance_001', 'Acme 财务一号', 'acme.finance@lindesk.local', 'pbkdf2-sha256:210000:bGluZGVzay1kZW1vLXYx:oeifo07otBNPOL-vyic07_7zqgf-B-4oVgd8GaMPzkk', 'ACTIVE', '2026-08-06T00:00:00Z')
 ON CONFLICT (id) DO UPDATE SET
     name = EXCLUDED.name,
     email = EXCLUDED.email,

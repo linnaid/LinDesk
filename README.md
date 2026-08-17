@@ -21,9 +21,9 @@ scripts/            本地初始化脚本与演示 seed
 
 ## 本地启动
 
-LinDesk 当前提供健康检查、demo 登录、多租户 RBAC，以及“未发货退款申请”首个业务纵切。未配置数据库 DSN 时会使用内存仓储；配置 PostgreSQL 且连接成功后，退款链路会切换到 PostgreSQL 仓储。
+LinDesk 当前提供健康检查、登录、多租户 RBAC，以及“未发货退款申请”首个业务纵切。未配置数据库 DSN 时会使用内存仓储和 Demo Auth；配置 PostgreSQL 且连接成功后，退款链路与 Auth Session 都会切换到 PostgreSQL。
 
-退款链路已经接入 demo 登录、RBAC 和租户数据隔离。业务接口会根据登录 token 中的租户身份查询订单和退款申请，不信任客户端伪造的业务 `tenant_id`。
+退款链路已经接入 Bearer Token、RBAC 和租户数据隔离。PostgreSQL Auth 只保存 token hash，并在每次鉴权时重新读取当前租户成员关系和角色权限；业务接口不信任客户端伪造的业务 `tenant_id`。
 
 这只是第一个可验证闭环，后续会在同一平台上继续补齐售前咨询、订单操作和售后工单能力。
 
@@ -93,9 +93,9 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 ## 当前进度
 
 - 已完成：订单查询、退款申请创建、退款审核通过/驳回、财务人工退款回填、成功/失败结案。
-- 已完成：demo 登录、Bearer Token、RBAC 权限校验和租户数据隔离。
+- 已完成：PostgreSQL Auth Session、Bearer Token、密码哈希、RBAC 权限校验和租户数据隔离。
 - 已完成：PostgreSQL 退款仓储、核心 schema、本地演示 seed 和初始化脚本。
-- 下一步：把 Auth 从内存 demo 升级为 PostgreSQL 持久化，或继续扩展订单/工单数据模型。
+- 下一步：为退款申请创建和财务回填增加 `Idempotency-Key`，并补齐高金额两级审批等剩余业务规则。
 
 如需使用本地配置文件：
 
@@ -111,7 +111,7 @@ go run ./cmd/lindesk -config configs/local.json
 - `LINDESK_DATABASE_DSN`
 - `LINDESK_HIGH_AMOUNT_APPROVAL_THRESHOLD`
 
-当前阶段服务启动时会尝试探测 PostgreSQL 连接；如果未配置 DSN 或连接不可用，会记录日志并继续使用内存仓储。连接成功时，退款链路会使用 PostgreSQL 仓储。
+当前阶段服务启动时会尝试探测 PostgreSQL 连接；如果未配置 DSN 或连接不可用，会记录日志并继续使用内存仓储和 Demo Auth。连接成功时，退款链路和 Auth Session 都会使用 PostgreSQL。
 
 ## PostgreSQL 端到端验证
 
@@ -129,7 +129,9 @@ go run ./cmd/lindesk -config configs/local.json
 - `docker-compose.yml` 启动本地 PostgreSQL，并创建 `lindesk` 数据库和用户。
 - `scripts/init_postgres.sh --reset` 会重建本地 schema，并执行 `scripts/seeds/` 下的 demo seed。
 - `configs/local.example.json` 的 DSN 与 compose 默认账号一致。
-- Auth 当前仍使用内存 Demo Service；seed 中的用户和成员用于满足 PostgreSQL 外键约束，后续会升级为数据库 Auth。
+- PostgreSQL Auth 使用 seed 中的用户、租户成员和角色权限完成登录，并将 Session 写入 `auth_sessions`。
+- 密码校验使用 PBKDF2-SHA256；新密码哈希使用随机盐，Demo seed 使用可重复初始化的预计算哈希。服务仍兼容读取旧 Demo SHA-256 哈希，便于滚动迁移。
+- 数据库只保存 access token 的 SHA-256 hash，不保存登录响应中的原始 token。
 
 跑完退款流程后，可以检查真实落库结果：
 
@@ -139,6 +141,9 @@ docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/
 
 docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/lindesk?sslmode=disable' \
   -c 'SELECT tenant_id, entity_type, action, operator_id FROM audit_logs ORDER BY created_at DESC;'
+
+docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/lindesk?sslmode=disable' \
+  -c 'SELECT tenant_id, user_id, expires_at, revoked_at FROM auth_sessions ORDER BY created_at DESC;'
 ```
 
 ## 验证

@@ -20,9 +20,10 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 ### 当前实现进度
 
 - 已完成：订单查询、退款申请创建、退款审批通过/驳回、财务退款回填、退款成功/失败结案、退款事务记录。
-- 暂用方案：通过 `X-Actor-ID` 模拟当前操作人，后续替换为真实登录态。
-- 暂未做：登录注册、多租户隔离、RBAC、真实支付渠道对接。
-- 推进建议：下一阶段统一做多租户底座和登录注册；这两项最好一起做，不要拆开。
+- 已完成：Bearer Token 登录、PostgreSQL Session、PBKDF2 密码哈希、多租户隔离和 RBAC。
+- 本地回退：未配置 PostgreSQL 时继续提供内存 Demo Auth，便于快速验证业务接口。
+- 暂未做：用户注册、成员管理接口、真实支付渠道对接和 Agent 辅助。
+- 推进建议：下一阶段先补幂等能力和高金额两级审批，再扩展会话与工单模型。
 
 ## 2. 第一版范围
 
@@ -60,9 +61,10 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 | 表 | 用途 | 关键字段与约束 |
 | --- | --- | --- |
 | `tenants` | 企业租户 | `id`、`name`、`status`、`plan`；`name` 唯一。 |
-| `tenant_members` | 租户成员与角色绑定 | `tenant_id`、`user_id`、`role_id`；同一租户下成员与角色组合唯一。 |
-| `users` | 内部操作人账号 | `id`、`name`、`email`、`status`；`email` 唯一。 |
-| `roles` / `user_roles` | RBAC 角色和人员授权 | 角色包括客服、客服主管、仓配、财务、运营管理员；建议后续补充 `tenant_id` 以支持租户级授权。 |
+| `tenant_members` | 租户成员与角色绑定 | `tenant_id`、`user_id`、`role_code`；当前每个用户在单个租户下绑定一个角色。 |
+| `users` | 内部操作人账号 | `id`、`name`、`email`、`password_hash`、`status`；邮箱按小写形式唯一。 |
+| `roles` | RBAC 角色和权限 | `code`、`name`、`permissions`；权限数组使用 JSONB 保存。 |
+| `auth_sessions` | 登录会话 | `token_hash`、`tenant_id`、`user_id`、`expires_at`、`revoked_at`；不保存原始 access token。 |
 | `customers` | 下单客户的最小必要信息 | `tenant_id`、`id`、`external_customer_id`、`masked_contact`；不保存非必要敏感信息。 |
 | `orders` | 订单快照与退款资格判断依据 | `tenant_id`、`id`、`external_order_no`、`customer_id`、`payment_status`、`fulfillment_status`、`paid_amount`、`currency`、`order_snapshot`；订单号在租户内唯一。 |
 | `order_items` | 订单商品明细 | `tenant_id`、`id`、`order_id`、`sku_id`、`quantity`、`paid_amount`；用于后续扩展部分退款。 |
@@ -125,4 +127,4 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 - 每次状态流转都能追溯到操作人、时间、意见和订单快照。
 - 退款不会因系统流程自动打款；没有财务人工回填渠道成功结果时，不得标记为退款成功。
 
-补充说明：当前代码已经跑通退款主闭环；后续重点是把内存仓储替换为 PostgreSQL，并补齐真实登录态、多租户隔离和 RBAC。
+补充说明：当前代码已经跑通 PostgreSQL 退款主闭环和持久化登录态；高金额两级审批、仓配确认、失败重试和取消流程仍属于后续业务增强。
