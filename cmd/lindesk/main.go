@@ -63,6 +63,7 @@ func main() {
 	)
 	var authService auth.Authenticator
 	if databaseHandle != nil {
+		// PostgreSQL 模式使用持久化用户、角色和 Session；本地无数据库时才回退 Demo Auth。
 		authService = auth.NewPostgresService(databaseHandle)
 		logger.Info("Using PostgreSQL auth service")
 	} else {

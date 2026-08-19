@@ -22,6 +22,7 @@ run_sql_file() {
 }
 
 if [[ "${1:-}" == "--reset" ]]; then
+  # 先删除 Session，解除其对 tenant_members 的外键依赖，再回滚核心表。
   run_sql_file "$repo_root/migrations/000002_create_auth_sessions.down.sql"
   run_sql_file "$repo_root/scripts/seeds/demo_data.down.sql"
   run_sql_file "$repo_root/migrations/000001_create_core_schema.down.sql"

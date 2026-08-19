@@ -1,3 +1,4 @@
+// 每次鉴权动态读取最新租户成员以及角色权限
 package auth
 
 import (
@@ -11,6 +12,7 @@ import (
 	"lindesk/internal/domain"
 )
 
+// PostgresRepository 将 Auth 数据映射到 users、tenant_members、roles 和 auth_sessions。
 type PostgresRepository struct {
 	db *sql.DB
 }
@@ -32,6 +34,7 @@ func NewPostgresService(db *sql.DB) *PersistentService {
 func (repository *PostgresRepository) FindUserByEmail(ctx context.Context, email string) (domain.User, error) {
 	var user domain.User
 	var status string
+	// 邮箱按小写比较，与 users_email_normalized_unique_idx 保持一致。
 	err := repository.db.QueryRowContext(ctx, `
 SELECT id, name, email, password_hash, status, created_at
 FROM users
@@ -49,6 +52,7 @@ WHERE lower(email) = lower($1)
 }
 
 func (repository *PostgresRepository) ResolveActor(ctx context.Context, userID, tenantID string) (domain.Actor, error) {
+	// 每次调用都从数据库读取成员和角色，避免把登录时的旧权限快照长期缓存。
 	rows, err := repository.db.QueryContext(ctx, `
 SELECT t.id, t.name, t.status, t.created_at,
        u.id, u.name, u.email, u.password_hash, u.status, u.created_at,
@@ -96,6 +100,7 @@ ORDER BY t.id, r.code
 			return domain.Actor{}, err
 		}
 
+		// 未指定租户时，一个用户属于多个租户必须明确拒绝，避免身份歧义。
 		if selectedTenantID != "" && selectedTenantID != tenant.ID {
 			return domain.Actor{}, ErrAmbiguousMembership
 		}
@@ -125,6 +130,7 @@ ORDER BY t.id, r.code
 }
 
 func (repository *PostgresRepository) CreateSession(ctx context.Context, session SessionRecord) error {
+	// token_hash 是唯一键，既防止重复写入，也避免数据库保存原始 Token。
 	_, err := repository.db.ExecContext(ctx, `
 INSERT INTO auth_sessions (
     id, token_hash, tenant_id, user_id, expires_at, revoked_at, created_at
@@ -150,6 +156,7 @@ WHERE token_hash = $1
 		&session.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
+		// 对外统一转换为无效 Token，避免暴露 Session 是否存在。
 		return SessionRecord{}, errSessionNotFound
 	}
 	if err != nil {
@@ -164,6 +171,7 @@ WHERE token_hash = $1
 }
 
 func (repository *PostgresRepository) RevokeSession(ctx context.Context, tokenHash string, revokedAt time.Time) error {
+	// COALESCE 保留首次注销时间，使重复注销不会覆盖原始审计时间。
 	_, err := repository.db.ExecContext(ctx, `
 UPDATE auth_sessions
 SET revoked_at = COALESCE(revoked_at, $1)

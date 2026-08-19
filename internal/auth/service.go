@@ -30,7 +30,7 @@ var (
 	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户歧义
 )
 
-// 认证必须提供哪些能力
+// Authenticator 定义 HTTP 层需要的最小认证能力，便于切换内存和 PostgreSQL 实现。
 type Authenticator interface {
 	Login(context.Context, LoginCommand) (Session, error)
 	Authenticate(context.Context, string) (domain.Actor, error)

@@ -17,6 +17,7 @@ var (
 	errSessionNotFound = errors.New("auth session not found")
 )
 
+// SessionRecord 是数据库中的会话记录，不包含登录响应中的原始 access token。
 type SessionRecord struct {
 	ID        string
 	TokenHash string
@@ -27,6 +28,7 @@ type SessionRecord struct {
 	CreatedAt time.Time
 }
 
+// Repository 抽象用户、租户权限和 Session 的持久化操作。
 type Repository interface {
 	FindUserByEmail(context.Context, string) (domain.User, error)
 	ResolveActor(context.Context, string, string) (domain.Actor, error)
@@ -35,6 +37,7 @@ type Repository interface {
 	RevokeSession(context.Context, string, time.Time) error
 }
 
+// PersistentService 使用数据库保存 Session，并在鉴权时动态加载最新权限。
 type PersistentService struct {
 	repository Repository
 	now        func() time.Time
@@ -76,7 +79,7 @@ func (service *PersistentService) Login(ctx context.Context, command LoginComman
 		return Session{}, ErrInvalidCredentials
 	}
 
-	// 确认 Actor
+	// 登录时先解析租户上下文，确保 Session 绑定到明确的租户和用户。
 	actor, err := service.repository.ResolveActor(ctx, user.ID, command.TenantID)
 	if err != nil {
 		return Session{}, err
@@ -89,6 +92,7 @@ func (service *PersistentService) Login(ctx context.Context, command LoginComman
 	now := service.now().UTC()
 	expiresAt := now.Add(sessionTTL)
 	tokenHash := TokenHash(token)
+	// 数据库只保存 token hash；原始 token 只在本次登录响应中返回给客户端。
 	record := SessionRecord{
 		ID:        sessionID(tokenHash),
 		TokenHash: tokenHash,
@@ -111,6 +115,8 @@ func (service *PersistentService) Authenticate(ctx context.Context, token string
 		return domain.Actor{}, ErrTokenRequired
 	}
 
+	// 先验证 Session，再根据记录中的用户和租户重新加载 Actor。
+	// 这样成员移除、角色调整或权限变更可以立即影响已有 Token。
 	record, err := service.repository.FindSessionByTokenHash(ctx, TokenHash(token))
 	if errors.Is(err, errSessionNotFound) {
 		return domain.Actor{}, ErrInvalidToken
@@ -142,6 +148,7 @@ func (service *PersistentService) Logout(ctx context.Context, token string) erro
 		return ErrTokenRequired
 	}
 
+	// 注销采用幂等更新：重复注销同一个 Token 不会产生额外状态变化。
 	if err := service.repository.RevokeSession(ctx, TokenHash(token), service.now().UTC()); err != nil {
 		return fmt.Errorf("revoke auth session: %w", err)
 	}
