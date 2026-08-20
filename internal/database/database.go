@@ -13,8 +13,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// 数据库未启用，不是异常失败
-var ErrDisabled = errors.New("database is disabled")
+var ErrDisabled = errors.New("database is disabled") // 未配置数据库或使用内存模式
 
 type Options struct {
 	MaxOpenConns    int

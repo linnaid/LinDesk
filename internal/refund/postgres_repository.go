@@ -46,10 +46,79 @@ WHERE tenant_id = $1 AND external_order_no = $2
 	return order, nil
 }
 
-func (repository *PostgresRepository) CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog) error {
-	return repository.withTx(ctx, func(tx *sql.Tx) error {
+func (repository *PostgresRepository) FindRefundRequestByIdempotency(ctx context.Context, idempotency IdempotencyRecord) (domain.RefundRequest, bool, error) {
+	var existingHash string
+	var responseData []byte
+	err := repository.db.QueryRowContext(ctx, `
+SELECT request_hash, response_data
+FROM idempotency_records
+WHERE tenant_id = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = $4
+`, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key).Scan(&existingHash, &responseData)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.RefundRequest{}, false, nil
+	}
+	if err != nil {
+		return domain.RefundRequest{}, false, err
+	}
+	if existingHash != idempotency.RequestHash {
+		return domain.RefundRequest{}, false, ErrIdempotencyKeyConflict
+	}
+
+	var existingRequest domain.RefundRequest
+	if err := json.Unmarshal(responseData, &existingRequest); err != nil {
+		return domain.RefundRequest{}, false, fmt.Errorf("unmarshal idempotency response: %w", err)
+	}
+	return existingRequest, true, nil
+}
+
+func (repository *PostgresRepository) CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog, idempotency IdempotencyRecord) (CreateRequestPersistenceResult, error) {
+	var result CreateRequestPersistenceResult
+	err := repository.withTx(ctx, func(tx *sql.Tx) error {
+		responseData, err := json.Marshal(request)
+		if err != nil {
+			return fmt.Errorf("marshal idempotency response: %w", err)
+		}
+
+		// 唯一约束会让相同作用域的并发请求在这里串行化。
+		insertResult, err := tx.ExecContext(ctx, `
+INSERT INTO idempotency_records (
+    id, tenant_id, actor_id, operation, idempotency_key, request_hash,
+    status, response_status, response_data, resource_type, resource_id,
+    created_at, completed_at
+) VALUES ($1, $2, $3, $4, $5, $6, 'COMPLETED', $7, $8, 'refund_request', $9, $10, $10)
+ON CONFLICT (tenant_id, actor_id, operation, idempotency_key) DO NOTHING
+`, idempotency.ID, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key, idempotency.RequestHash, idempotency.ResponseStatus, responseData, request.ID, idempotency.CreatedAt)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := insertResult.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			var existingHash string
+			var existingResponse []byte
+			if err := tx.QueryRowContext(ctx, `
+SELECT request_hash, response_data
+FROM idempotency_records
+WHERE tenant_id = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = $4
+`, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key).Scan(&existingHash, &existingResponse); err != nil {
+				return err
+			}
+			if existingHash != idempotency.RequestHash {
+				return ErrIdempotencyKeyConflict
+			}
+
+			var existingRequest domain.RefundRequest
+			if err := json.Unmarshal(existingResponse, &existingRequest); err != nil {
+				return fmt.Errorf("unmarshal idempotency response: %w", err)
+			}
+			result = CreateRequestPersistenceResult{Request: existingRequest, Replayed: true}
+			return nil
+		}
+
 		var activeRequestID string
-		err := tx.QueryRowContext(ctx, `
+		err = tx.QueryRowContext(ctx, `
 SELECT id
 FROM refund_requests
 WHERE tenant_id = $1
@@ -80,8 +149,18 @@ INSERT INTO refund_requests (
 			return err
 		}
 
-		return insertAuditLog(ctx, tx, auditLog)
+		if err := insertAuditLog(ctx, tx, auditLog); err != nil {
+			return err
+		}
+
+		result = CreateRequestPersistenceResult{Request: request}
+		return nil
 	})
+	if err != nil {
+		return CreateRequestPersistenceResult{}, err
+	}
+
+	return result, nil
 }
 
 func (repository *PostgresRepository) FindRefundRequestByRequestNo(ctx context.Context, tenantID string, requestNo string) (domain.RefundRequest, error) {
@@ -259,6 +338,7 @@ WHERE tenant_id = $3 AND request_no = $4
 	return updatedRequest, nil
 }
 
+// 开启事务、执行回调、成功提交、失败回滚
 func (repository *PostgresRepository) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := repository.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -399,6 +479,7 @@ INSERT INTO refund_transactions (
 	return err
 }
 
+// 把一个 domain.AuditLog 审计日志对象转换成数据库需要的格式，然后插入 PostgreSQL 的 audit_logs 表
 func insertAuditLog(ctx context.Context, tx *sql.Tx, auditLog domain.AuditLog) error {
 	beforeData, err := json.Marshal(auditLog.BeforeData)
 	if err != nil {

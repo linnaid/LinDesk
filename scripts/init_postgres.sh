@@ -22,6 +22,8 @@ run_sql_file() {
 }
 
 if [[ "${1:-}" == "--reset" ]]; then
+  # 幂等记录依赖租户成员，必须在 Auth Session 和核心身份表之前删除。
+  run_sql_file "$repo_root/migrations/000003_create_idempotency_records.down.sql"
   # 先删除 Session，解除其对 tenant_members 的外键依赖，再回滚核心表。
   run_sql_file "$repo_root/migrations/000002_create_auth_sessions.down.sql"
   run_sql_file "$repo_root/scripts/seeds/demo_data.down.sql"
@@ -30,6 +32,7 @@ fi
 
 run_sql_file "$repo_root/migrations/000001_create_core_schema.up.sql"
 run_sql_file "$repo_root/migrations/000002_create_auth_sessions.up.sql"
+run_sql_file "$repo_root/migrations/000003_create_idempotency_records.up.sql"
 run_sql_file "$repo_root/scripts/seeds/demo_data.up.sql"
 
 echo "PostgreSQL schema and demo data are ready."

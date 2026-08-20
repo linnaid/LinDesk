@@ -13,8 +13,8 @@ import (
 const sessionTTL = 8 * time.Hour
 
 var (
-	errUserNotFound    = errors.New("auth user not found")
-	errSessionNotFound = errors.New("auth session not found")
+	errUserNotFound    = errors.New("auth user not found")    // 数据库中未找到认证用户
+	errSessionNotFound = errors.New("auth session not found") // 数据库中未找到登录会话
 )
 
 // SessionRecord 是数据库中的会话记录，不包含登录响应中的原始 access token。

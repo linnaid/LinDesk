@@ -54,6 +54,7 @@ curl http://localhost:8080/orders/LD202608040001 \
 
 CREATE_RESPONSE=$(curl -s -X POST http://localhost:8080/refund-requests \
   -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: refund-demo-001' \
   -H "Authorization: Bearer $CS_TOKEN" \
   -d '{
     "external_order_no": "LD202608040001",
@@ -93,9 +94,20 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 ## 当前进度
 
 - 已完成：订单查询、退款申请创建、退款审核通过/驳回、财务人工退款回填、成功/失败结案。
+- 已完成：退款申请创建接口的 `Idempotency-Key`、请求摘要校验、首次结果复用和并发重复提交防护。
 - 已完成：PostgreSQL Auth Session、Bearer Token、密码哈希、RBAC 权限校验和租户数据隔离。
 - 已完成：PostgreSQL 退款仓储、核心 schema、本地演示 seed 和初始化脚本。
-- 下一步：为退款申请创建和财务回填增加 `Idempotency-Key`，并补齐高金额两级审批等剩余业务规则。
+- 下一步：为财务退款回填增加 `Idempotency-Key`，并补齐高金额两级审批等剩余业务规则。
+
+### 创建退款申请的幂等规则
+
+`POST /refund-requests` 必须携带长度不超过 255 的 `Idempotency-Key`：
+
+- 幂等作用域为当前租户、当前操作人和“创建退款申请”操作。
+- 相同幂等键与相同业务参数重复提交时，不会再次创建退款申请，而是返回首次 `201` 响应。
+- 重放响应会携带 `Idempotency-Replayed: true`。
+- 相同幂等键携带不同业务参数时返回 `409 idempotency_key_conflict`。
+- PostgreSQL 会在同一事务内写入幂等记录、退款申请和审计日志，避免并发重复创建。
 
 如需使用本地配置文件：
 
@@ -144,6 +156,9 @@ docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/
 
 docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/lindesk?sslmode=disable' \
   -c 'SELECT tenant_id, user_id, expires_at, revoked_at FROM auth_sessions ORDER BY created_at DESC;'
+
+docker compose exec -T postgres psql 'postgres://lindesk:lindesk@localhost:5432/lindesk?sslmode=disable' \
+  -c 'SELECT tenant_id, actor_id, operation, idempotency_key, resource_id FROM idempotency_records ORDER BY created_at DESC;'
 ```
 
 ## 验证

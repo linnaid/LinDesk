@@ -36,6 +36,7 @@ func (scanner stubScanner) Scan(dest ...any) error {
 		case *sql.NullTime:
 			*target = value.(sql.NullTime)
 		default:
+			// 测试扫描器不支持当前目标类型。
 			return errors.New("unsupported scan target")
 		}
 	}

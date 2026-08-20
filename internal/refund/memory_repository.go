@@ -21,15 +21,23 @@ type InMemoryRepository struct {
 	transactions     map[string][]domain.RefundTransaction
 	providerRefundNo map[string]string
 	auditLogList     []domain.AuditLog
+	// idempotencyRecords 保存首次成功响应，模拟 PostgreSQL idempotency_records 表。
+	idempotencyRecords map[string]memoryIdempotencyRecord
+}
+
+type memoryIdempotencyRecord struct {
+	RequestHash string
+	Request     domain.RefundRequest
 }
 
 func NewInMemoryRepository(orders []domain.Order) *InMemoryRepository {
 	repository := &InMemoryRepository{
-		orders:           make(map[string]domain.Order, len(orders)),
-		requests:         make(map[string]domain.RefundRequest),
-		approvals:        make(map[string][]domain.Approval),
-		transactions:     make(map[string][]domain.RefundTransaction),
-		providerRefundNo: make(map[string]string),
+		orders:             make(map[string]domain.Order, len(orders)),
+		requests:           make(map[string]domain.RefundRequest),
+		approvals:          make(map[string][]domain.Approval),
+		transactions:       make(map[string][]domain.RefundTransaction),
+		providerRefundNo:   make(map[string]string),
+		idempotencyRecords: make(map[string]memoryIdempotencyRecord),
 	}
 
 	for _, order := range orders {
@@ -106,18 +114,42 @@ func (repository *InMemoryRepository) FindOrderByExternalOrderNo(_ context.Conte
 	return order, nil
 }
 
-func (repository *InMemoryRepository) CreateRefundRequest(_ context.Context, request domain.RefundRequest, auditLog domain.AuditLog) error {
+// 幂等查询
+func (repository *InMemoryRepository) FindRefundRequestByIdempotency(_ context.Context, idempotency IdempotencyRecord) (domain.RefundRequest, bool, error) {
+	repository.mutex.RLock()
+	defer repository.mutex.RUnlock()
+
+	existing, ok := repository.idempotencyRecords[idempotencyScopeKey(idempotency)]
+	if !ok {
+		return domain.RefundRequest{}, false, nil
+	}
+	if existing.RequestHash != idempotency.RequestHash {
+		return domain.RefundRequest{}, false, ErrIdempotencyKeyConflict
+	}
+
+	return existing.Request, true, nil
+}
+
+func (repository *InMemoryRepository) CreateRefundRequest(_ context.Context, request domain.RefundRequest, auditLog domain.AuditLog, idempotency IdempotencyRecord) (CreateRequestPersistenceResult, error) {
 	repository.mutex.Lock()
 	defer repository.mutex.Unlock()
 
+	idempotencyKey := idempotencyScopeKey(idempotency)
+	if existing, ok := repository.idempotencyRecords[idempotencyKey]; ok {
+		if existing.RequestHash != idempotency.RequestHash {
+			return CreateRequestPersistenceResult{}, ErrIdempotencyKeyConflict
+		}
+		return CreateRequestPersistenceResult{Request: existing.Request, Replayed: true}, nil
+	}
+
 	key := tenantKey(request.TenantID, request.RequestNo)
 	if _, exists := repository.requests[key]; exists {
-		return fmt.Errorf("refund request %q already exists", request.RequestNo)
+		return CreateRequestPersistenceResult{}, fmt.Errorf("refund request %q already exists", request.RequestNo)
 	}
 
 	for _, existingRequest := range repository.requests {
 		if existingRequest.TenantID == request.TenantID && existingRequest.OrderID == request.OrderID && IsActiveStatus(existingRequest.Status) {
-			return ErrActiveRefundRequestExists
+			return CreateRequestPersistenceResult{}, ErrActiveRefundRequestExists
 		}
 	}
 
@@ -129,7 +161,16 @@ func (repository *InMemoryRepository) CreateRefundRequest(_ context.Context, req
 		repository.transactions[key] = nil
 	}
 	repository.auditLogList = append(repository.auditLogList, auditLog)
-	return nil
+	repository.idempotencyRecords[idempotencyKey] = memoryIdempotencyRecord{
+		RequestHash: idempotency.RequestHash,
+		Request:     request,
+	}
+	return CreateRequestPersistenceResult{Request: request}, nil
+}
+
+// 把一个 IdempotencyRecord 中的四个字段组成一个字符串，作为Map 的 Key
+func idempotencyScopeKey(record IdempotencyRecord) string {
+	return strings.Join([]string{record.TenantID, record.ActorID, record.Operation, record.Key}, "\x00")
 }
 
 func (repository *InMemoryRepository) FindRefundRequestByRequestNo(_ context.Context, tenantID string, requestNo string) (domain.RefundRequest, error) {

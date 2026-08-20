@@ -3,6 +3,7 @@ package refund
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,8 +15,9 @@ type fixedClock struct {
 }
 
 const (
-	demoTenantID = "tenant_demo"
-	acmeTenantID = "tenant_acme"
+	demoTenantID       = "tenant_demo"
+	acmeTenantID       = "tenant_acme"
+	testIdempotencyKey = "test-refund-create"
 )
 
 func (clock fixedClock) Now() time.Time {
@@ -50,6 +52,7 @@ func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
 
 	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -87,6 +90,180 @@ func TestCreateRequestCreatesPendingReviewRequest(t *testing.T) {
 	}
 }
 
+func TestCreateRequestRequiresIdempotencyKey(t *testing.T) {
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())
+
+	_, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	})
+	if !errors.Is(err, ErrIdempotencyKeyRequired) {
+		t.Fatalf("CreateRequest() error = %v, want %v", err, ErrIdempotencyKeyRequired)
+	}
+}
+
+func TestCreateRequestReplaysFirstResultForSameIdempotencyKey(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	command := CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  "refund-create-replay",
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		ReasonNote:      "客户取消未发货订单",
+		SubmittedBy:     "user_cs_001",
+	}
+
+	first, err := service.CreateRequest(context.Background(), command)
+	if err != nil {
+		t.Fatalf("first CreateRequest() error = %v", err)
+	}
+	second, err := service.CreateRequest(context.Background(), command)
+	if err != nil {
+		t.Fatalf("second CreateRequest() error = %v", err)
+	}
+
+	if first.IdempotencyReplayed {
+		t.Fatalf("first IdempotencyReplayed = true, want false")
+	}
+	if !second.IdempotencyReplayed {
+		t.Fatalf("second IdempotencyReplayed = false, want true")
+	}
+	if second.Request.RequestNo != first.Request.RequestNo {
+		t.Fatalf("request numbers = %q and %q, want same result", first.Request.RequestNo, second.Request.RequestNo)
+	}
+	if len(repository.AuditLogs()) != 1 {
+		t.Fatalf("AuditLogs length = %d, want 1", len(repository.AuditLogs()))
+	}
+}
+
+func TestCreateRequestReplayIgnoresLaterOrderStateChanges(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	command := CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  "refund-create-order-changed",
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}
+
+	first, err := service.CreateRequest(context.Background(), command)
+	if err != nil {
+		t.Fatalf("first CreateRequest() error = %v", err)
+	}
+	repository.mutex.Lock()
+	orderKey := tenantKey(demoTenantID, command.ExternalOrderNo)
+	order := repository.orders[orderKey]
+	order.FulfillmentStatus = domain.FulfillmentStatusShipped
+	repository.orders[orderKey] = order
+	repository.mutex.Unlock()
+
+	second, err := service.CreateRequest(context.Background(), command)
+	if err != nil {
+		t.Fatalf("second CreateRequest() error = %v, want idempotent replay", err)
+	}
+	if !second.IdempotencyReplayed || second.Request.RequestNo != first.Request.RequestNo {
+		t.Fatalf("second result = %+v, want replay of %q", second, first.Request.RequestNo)
+	}
+}
+
+func TestCreateRequestRejectsIdempotencyKeyWithDifferentPayload(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	command := CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  "refund-create-conflict",
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}
+
+	if _, err := service.CreateRequest(context.Background(), command); err != nil {
+		t.Fatalf("first CreateRequest() error = %v", err)
+	}
+	command.RequestedAmount = 12_000
+	_, err := service.CreateRequest(context.Background(), command)
+	if !errors.Is(err, ErrIdempotencyKeyConflict) {
+		t.Fatalf("second CreateRequest() error = %v, want %v", err, ErrIdempotencyKeyConflict)
+	}
+}
+
+func TestCreateRequestConcurrentRetriesCreateOnce(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	command := CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  "refund-create-concurrent",
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan RequestDetail, workers)
+	errorsByWorker := make(chan error, workers)
+	var waitGroup sync.WaitGroup
+	for range workers {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			detail, err := service.CreateRequest(context.Background(), command)
+			if err != nil {
+				errorsByWorker <- err
+				return
+			}
+			results <- detail
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	close(errorsByWorker)
+
+	for err := range errorsByWorker {
+		t.Fatalf("concurrent CreateRequest() error = %v", err)
+	}
+	requestNo := ""
+	firstResultCount := 0
+	resultCount := 0
+	for detail := range results {
+		resultCount++
+		if requestNo == "" {
+			requestNo = detail.Request.RequestNo
+		}
+		if detail.Request.RequestNo != requestNo {
+			t.Fatalf("RequestNo = %q, want %q", detail.Request.RequestNo, requestNo)
+		}
+		if !detail.IdempotencyReplayed {
+			firstResultCount++
+		}
+	}
+	if resultCount != workers {
+		t.Fatalf("result count = %d, want %d", resultCount, workers)
+	}
+	if firstResultCount != 1 {
+		t.Fatalf("first result count = %d, want 1", firstResultCount)
+	}
+	if len(repository.AuditLogs()) != 1 {
+		t.Fatalf("AuditLogs length = %d, want 1", len(repository.AuditLogs()))
+	}
+}
+
 func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
 	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
 	repository := NewInMemoryRepository([]domain.Order{
@@ -106,6 +283,7 @@ func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
 
 	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040099",
 		RequestedAmount: 50_000,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -125,6 +303,7 @@ func TestCreateRequestRejectsIneligibleOrder(t *testing.T) {
 
 	_, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040002",
 		RequestedAmount: 8_800,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -141,6 +320,7 @@ func TestCreateRequestRejectsAmountAboveRefundableBalance(t *testing.T) {
 
 	_, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_901,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -157,6 +337,7 @@ func TestCreateRequestRejectsActiveRequestForSameOrder(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	command := CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -166,6 +347,7 @@ func TestCreateRequestRejectsActiveRequestForSameOrder(t *testing.T) {
 	if _, err := service.CreateRequest(context.Background(), command); err != nil {
 		t.Fatalf("first CreateRequest() error = %v", err)
 	}
+	command.IdempotencyKey = "test-refund-create-second"
 	_, err := service.CreateRequest(context.Background(), command)
 	if !errors.Is(err, ErrActiveRefundRequestExists) {
 		t.Fatalf("second CreateRequest() error = %v, want %v", err, ErrActiveRefundRequestExists)
@@ -179,6 +361,7 @@ func TestCreateRequestScopesActiveRequestsByTenant(t *testing.T) {
 
 	demoDetail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -190,6 +373,7 @@ func TestCreateRequestScopesActiveRequestsByTenant(t *testing.T) {
 
 	acmeDetail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        acmeTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 25_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -207,6 +391,7 @@ func TestCreateRequestScopesActiveRequestsByTenant(t *testing.T) {
 
 	_, err = service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  "test-refund-create-second",
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -224,6 +409,7 @@ func TestGetRequestReturnsNotFoundAcrossTenant(t *testing.T) {
 
 	detail, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -245,6 +431,7 @@ func TestApproveRequestTransitionsToApprovedAndStoresApproval(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -285,6 +472,7 @@ func TestApproveRequestRejectsSubmitterSelfApproval(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -310,6 +498,7 @@ func TestRejectRequestTransitionsToRejected(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -341,6 +530,7 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -392,6 +582,7 @@ func TestRecordTransactionTransitionsApprovedRequestToFailed(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -434,6 +625,7 @@ func TestRecordTransactionRejectsPendingReviewRequest(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -462,6 +654,7 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -499,6 +692,7 @@ func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
 
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 12_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",
@@ -508,6 +702,7 @@ func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
 	}
 	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
 		TenantID:        acmeTenantID,
+		IdempotencyKey:  testIdempotencyKey,
 		ExternalOrderNo: "LD202608040001",
 		RequestedAmount: 25_900,
 		ReasonCode:      "CUSTOMER_CANCELLED",

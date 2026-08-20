@@ -18,8 +18,9 @@ type fixedHTTPClock struct {
 }
 
 const (
-	demoTenantID = "tenant_demo"
-	acmeTenantID = "tenant_acme"
+	demoTenantID       = "tenant_demo"
+	acmeTenantID       = "tenant_acme"
+	testIdempotencyKey = "test-refund-create"
 )
 
 type defaultTenantHandler struct {
@@ -86,6 +87,7 @@ func TestCreateAndGetRefundRequest(t *testing.T) {
   "submitted_by": "user_cs_001"
 }`)
 	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createResponse := httptest.NewRecorder()
 
 	handler.ServeHTTP(createResponse, createRequest)
@@ -114,6 +116,96 @@ func TestCreateAndGetRefundRequest(t *testing.T) {
 	}
 }
 
+func TestCreateRefundRequestRequiresIdempotencyKey(t *testing.T) {
+	handler := newTestHandler()
+	request := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestCreateRefundRequestReplaysFirstResponse(t *testing.T) {
+	handler := newTestHandler()
+	body := `{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "reason_note": "客户取消未发货订单",
+  "submitted_by": "user_cs_001"
+}`
+
+	firstRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(body))
+	firstRequest.Header.Set("Idempotency-Key", "http-refund-replay")
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, firstRequest)
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d, body = %s", firstResponse.Code, http.StatusCreated, firstResponse.Body.String())
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(body))
+	secondRequest.Header.Set("Idempotency-Key", "http-refund-replay")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, secondRequest)
+	if secondResponse.Code != http.StatusCreated {
+		t.Fatalf("second status = %d, want %d, body = %s", secondResponse.Code, http.StatusCreated, secondResponse.Body.String())
+	}
+	if secondResponse.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("Idempotency-Replayed = %q, want true", secondResponse.Header().Get("Idempotency-Replayed"))
+	}
+
+	var firstBody, secondBody struct {
+		RequestNo string `json:"request_no"`
+	}
+	if err := json.NewDecoder(firstResponse.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if err := json.NewDecoder(secondResponse.Body).Decode(&secondBody); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if firstBody.RequestNo != secondBody.RequestNo {
+		t.Fatalf("request numbers = %q and %q, want same", firstBody.RequestNo, secondBody.RequestNo)
+	}
+}
+
+func TestCreateRefundRequestRejectsIdempotencyKeyConflict(t *testing.T) {
+	handler := newTestHandler()
+	firstRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12900,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`))
+	firstRequest.Header.Set("Idempotency-Key", "http-refund-conflict")
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, firstRequest)
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d", firstResponse.Code, http.StatusCreated)
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040001",
+  "requested_amount": 12000,
+  "reason_code": "CUSTOMER_CANCELLED",
+  "submitted_by": "user_cs_001"
+}`))
+	secondRequest.Header.Set("Idempotency-Key", "http-refund-conflict")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, secondRequest)
+
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("second status = %d, want %d, body = %s", secondResponse.Code, http.StatusConflict, secondResponse.Body.String())
+	}
+}
+
 func TestCreateRefundRequestRejectsShippedOrder(t *testing.T) {
 	handler := newTestHandler()
 	createBody := strings.NewReader(`{
@@ -123,6 +215,7 @@ func TestCreateRefundRequestRejectsShippedOrder(t *testing.T) {
   "submitted_by": "user_cs_001"
 }`)
 	request := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	request.Header.Set("Idempotency-Key", testIdempotencyKey)
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -141,6 +234,7 @@ func TestApproveRefundRequest(t *testing.T) {
   "submitted_by": "user_cs_001"
 }`)
 	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, createRequest)
 	if createResponse.Code != http.StatusCreated {
@@ -191,6 +285,7 @@ func TestApproveRefundRequestRejectsSelfApproval(t *testing.T) {
   "submitted_by": "user_cs_001"
 }`)
 	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, createRequest)
 
@@ -219,7 +314,8 @@ func TestRefundFlowWithLoginAndRBAC(t *testing.T) {
   "requested_amount": 12900,
   "reason_code": "CUSTOMER_CANCELLED",
   "reason_note": "客户取消未发货订单"
-}`))
+	}`))
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createRequest.Header.Set("Authorization", "Bearer "+csToken)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, createRequest)
@@ -374,6 +470,7 @@ func TestRecordRefundTransactionRejectsPendingReviewRequest(t *testing.T) {
   "submitted_by": "user_cs_001"
 }`)
 	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, createRequest)
 
@@ -403,6 +500,7 @@ func createApprovedRefundRequest(t *testing.T, handler http.Handler) {
   "submitted_by": "user_cs_001"
 }`)
 	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", createBody)
+	createRequest.Header.Set("Idempotency-Key", testIdempotencyKey)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, createRequest)
 	if createResponse.Code != http.StatusCreated {
@@ -485,7 +583,8 @@ func createSecureRefundRequest(t *testing.T, handler http.Handler, token string,
   "requested_amount": %d,
   "reason_code": "CUSTOMER_CANCELLED",
   "reason_note": "客户取消未发货订单"
-}`, requestedAmount)))
+	}`, requestedAmount)))
+	request.Header.Set("Idempotency-Key", testIdempotencyKey)
 	request.Header.Set("Authorization", "Bearer "+token)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

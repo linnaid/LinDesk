@@ -205,6 +205,7 @@ func handleCreateRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 
 		detail, err := refunds.CreateRequest(request.Context(), apprefund.CreateRequestCommand{
 			TenantID:        currentTenantID(request),
+			IdempotencyKey:  request.Header.Get("Idempotency-Key"),
 			ExternalOrderNo: body.ExternalOrderNo,
 			RequestedAmount: body.RequestedAmount,
 			ReasonCode:      body.ReasonCode,
@@ -216,6 +217,10 @@ func handleCreateRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 			return
 		}
 
+		if detail.IdempotencyReplayed {
+			// 客户端可以据此区分首次创建和服务端复用的首次结果。
+			writer.Header().Set("Idempotency-Replayed", "true")
+		}
 		writeJSON(writer, http.StatusCreated, newRefundRequestResponse(detail))
 	}
 }
@@ -574,12 +579,16 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 	// 409 状态冲突
 	case errors.Is(err, apprefund.ErrActiveRefundRequestExists):
 		writeError(writer, http.StatusConflict, "active_refund_request_exists", err.Error())
+	case errors.Is(err, apprefund.ErrIdempotencyKeyConflict):
+		writeError(writer, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	// 422 业务规则不允许
 	case errors.Is(err, apprefund.ErrOrderNotRefundable), errors.Is(err, apprefund.ErrAmountExceedsRefundable):
 		writeError(writer, http.StatusUnprocessableEntity, "refund_request_not_allowed", err.Error())
 	// 400 参数校验失败
 	case errors.Is(err, apprefund.ErrExternalOrderNoRequired),
 		errors.Is(err, apprefund.ErrTenantRequired),
+		errors.Is(err, apprefund.ErrIdempotencyKeyRequired),
+		errors.Is(err, apprefund.ErrIdempotencyKeyTooLong),
 		errors.Is(err, apprefund.ErrRequestedAmountPositive),
 		errors.Is(err, apprefund.ErrReasonCodeRequired),
 		errors.Is(err, apprefund.ErrSubmittedByRequired),

@@ -17,17 +17,17 @@ import (
 
 // 一组认证/授权错误
 var (
-	ErrEmailRequired       = errors.New("email is required")
-	ErrPasswordRequired    = errors.New("password is required")
-	ErrInvalidCredentials  = errors.New("email or password is invalid") // 用户名密码错误
-	ErrTenantRequired      = errors.New("tenant is required")           // 租户未指定
-	ErrTenantNotFound      = errors.New("tenant not found")
-	ErrTokenRequired       = errors.New("authorization token is required")
-	ErrInvalidToken        = errors.New("authorization token is invalid")
-	ErrSessionExpired      = errors.New("authorization session is expired") // Session 已过期
-	ErrPermissionDenied    = errors.New("permission denied")
-	ErrNoActiveMembership  = errors.New("user has no active tenant membership") // 没有租户关系
-	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户歧义
+	ErrEmailRequired       = errors.New("email is required")                    // 未提供登录邮箱
+	ErrPasswordRequired    = errors.New("password is required")                 // 未提供登录密码
+	ErrInvalidCredentials  = errors.New("email or password is invalid")         // 邮箱或密码错误
+	ErrTenantRequired      = errors.New("tenant is required")                   // 未指定租户
+	ErrTenantNotFound      = errors.New("tenant not found")                     // 租户不存在或不可用
+	ErrTokenRequired       = errors.New("authorization token is required")      // 未提供访问令牌
+	ErrInvalidToken        = errors.New("authorization token is invalid")       // 访问令牌无效或已注销
+	ErrSessionExpired      = errors.New("authorization session is expired")     // 登录会话已过期
+	ErrPermissionDenied    = errors.New("permission denied")                    // 当前用户缺少所需权限
+	ErrNoActiveMembership  = errors.New("user has no active tenant membership") // 用户没有有效租户成员关系
+	ErrAmbiguousMembership = errors.New("user belongs to multiple tenants")     // 多租户用户未指定当前租户
 )
 
 // Authenticator 定义 HTTP 层需要的最小认证能力，便于切换内存和 PostgreSQL 实现。

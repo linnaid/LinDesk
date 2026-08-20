@@ -20,10 +20,11 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 ### 当前实现进度
 
 - 已完成：订单查询、退款申请创建、退款审批通过/驳回、财务退款回填、退款成功/失败结案、退款事务记录。
+- 已完成：退款申请创建接口的幂等键、请求摘要校验、首次结果复用和并发防重复。
 - 已完成：Bearer Token 登录、PostgreSQL Session、PBKDF2 密码哈希、多租户隔离和 RBAC。
 - 本地回退：未配置 PostgreSQL 时继续提供内存 Demo Auth，便于快速验证业务接口。
 - 暂未做：用户注册、成员管理接口、真实支付渠道对接和 Agent 辅助。
-- 推进建议：下一阶段先补幂等能力和高金额两级审批，再扩展会话与工单模型。
+- 推进建议：下一阶段继续补财务回填幂等和高金额两级审批，再扩展会话与工单模型。
 
 ## 2. 第一版范围
 
@@ -65,6 +66,7 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 | `users` | 内部操作人账号 | `id`、`name`、`email`、`password_hash`、`status`；邮箱按小写形式唯一。 |
 | `roles` | RBAC 角色和权限 | `code`、`name`、`permissions`；权限数组使用 JSONB 保存。 |
 | `auth_sessions` | 登录会话 | `token_hash`、`tenant_id`、`user_id`、`expires_at`、`revoked_at`；不保存原始 access token。 |
+| `idempotency_records` | 写接口幂等记录 | `tenant_id`、`actor_id`、`operation`、`idempotency_key`、`request_hash`、`response_data`、`resource_id`；同一作用域下幂等键唯一。 |
 | `customers` | 下单客户的最小必要信息 | `tenant_id`、`id`、`external_customer_id`、`masked_contact`；不保存非必要敏感信息。 |
 | `orders` | 订单快照与退款资格判断依据 | `tenant_id`、`id`、`external_order_no`、`customer_id`、`payment_status`、`fulfillment_status`、`paid_amount`、`currency`、`order_snapshot`；订单号在租户内唯一。 |
 | `order_items` | 订单商品明细 | `tenant_id`、`id`、`order_id`、`sku_id`、`quantity`、`paid_amount`；用于后续扩展部分退款。 |
@@ -78,6 +80,7 @@ AI Agent 不是最终业务执行者，而是辅助客服完成分类、总结�
 
 - `orders.external_order_no`、`refund_requests.request_no` 和 `refund_transactions.provider_refund_no` 必须唯一。
 - 同一订单在存在 `PENDING_REVIEW`、`APPROVED`、`PROCESSING` 状态的退款申请时，不允许再创建新的退款申请。
+- 创建退款申请时，相同幂等键与相同请求必须返回首次结果；相同键对应不同请求必须拒绝。
 - 申请金额不得大于 `订单实付金额 - 已成功退款金额`。
 - 状态流转与审核/退款回执写入必须在同一数据库事务中记录对应的 `audit_logs`。
 

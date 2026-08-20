@@ -2,48 +2,58 @@ package refund
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"lindesk/internal/domain"
 )
 
 var (
-	ErrOrderNotFound                = errors.New("order not found")
-	ErrRefundRequestNotFound        = errors.New("refund request not found")
-	ErrTenantRequired               = errors.New("tenant is required")
-	ErrExternalOrderNoRequired      = errors.New("external order number is required")
-	ErrRequestedAmountPositive      = errors.New("requested amount must be positive")
-	ErrReasonCodeRequired           = errors.New("reason code is required")
-	ErrSubmittedByRequired          = errors.New("submitted by is required")
-	ErrOrderNotRefundable           = errors.New("order is not eligible for unshipped refund")
-	ErrAmountExceedsRefundable      = errors.New("requested amount exceeds refundable amount")
-	ErrActiveRefundRequestExists    = errors.New("active refund request exists for order")
-	ErrReviewRequestNoRequired      = errors.New("refund request number is required")
-	ErrApprovalDecisionByRequired   = errors.New("decision by is required")
-	ErrApprovalCommentRequired      = errors.New("approval comment is required")
-	ErrRefundRequestNotReviewable   = errors.New("refund request is not pending review")
-	ErrApprovalActorSameAsSubmitter = errors.New("approver cannot be the submitter")
-	ErrTransactionRequestNoRequired = errors.New("refund request number is required")
-	ErrTransactionProviderRequired  = errors.New("refund provider is required")
-	ErrProviderRefundNoRequired     = errors.New("provider refund number is required")
-	ErrTransactionAmountPositive    = errors.New("refund transaction amount must be positive")
-	ErrTransactionAmountMismatch    = errors.New("refund transaction amount must equal approved amount")
-	ErrTransactionProcessedByNeeded = errors.New("processed by is required")
-	ErrTransactionStatusInvalid     = errors.New("refund transaction status is invalid")
-	ErrFailureReasonRequired        = errors.New("failure reason is required")
-	ErrRefundRequestNotApproved     = errors.New("refund request is not approved")
-	ErrProviderRefundNoExists       = errors.New("provider refund number already exists")
+	ErrOrderNotFound                = errors.New("order not found")                                           // 订单不存在
+	ErrRefundRequestNotFound        = errors.New("refund request not found")                                  // 退款申请不存在
+	ErrTenantRequired               = errors.New("tenant is required")                                        // 未指定租户
+	ErrExternalOrderNoRequired      = errors.New("external order number is required")                         // 未提供外部订单号
+	ErrRequestedAmountPositive      = errors.New("requested amount must be positive")                         // 申请金额必须大于零
+	ErrReasonCodeRequired           = errors.New("reason code is required")                                   // 未提供退款原因码
+	ErrSubmittedByRequired          = errors.New("submitted by is required")                                  // 未提供申请提交人
+	ErrOrderNotRefundable           = errors.New("order is not eligible for unshipped refund")                // 订单不满足未发货退款条件
+	ErrAmountExceedsRefundable      = errors.New("requested amount exceeds refundable amount")                // 申请金额超过可退余额
+	ErrActiveRefundRequestExists    = errors.New("active refund request exists for order")                    // 订单已有进行中的退款申请
+	ErrReviewRequestNoRequired      = errors.New("refund request number is required")                         // 审核时未提供退款申请号
+	ErrApprovalDecisionByRequired   = errors.New("decision by is required")                                   // 未提供审核人
+	ErrApprovalCommentRequired      = errors.New("approval comment is required")                              // 未提供审核意见
+	ErrRefundRequestNotReviewable   = errors.New("refund request is not pending review")                      // 退款申请不在待审核状态
+	ErrApprovalActorSameAsSubmitter = errors.New("approver cannot be the submitter")                          // 提交人不能审核本人申请
+	ErrTransactionRequestNoRequired = errors.New("refund request number is required")                         // 财务回填未提供退款申请号
+	ErrTransactionProviderRequired  = errors.New("refund provider is required")                               // 未提供退款渠道
+	ErrProviderRefundNoRequired     = errors.New("provider refund number is required")                        // 成功回填未提供渠道退款号
+	ErrTransactionAmountPositive    = errors.New("refund transaction amount must be positive")                // 财务回填金额必须大于零
+	ErrTransactionAmountMismatch    = errors.New("refund transaction amount must equal approved amount")      // 财务回填金额与批准金额不一致
+	ErrTransactionProcessedByNeeded = errors.New("processed by is required")                                  // 未提供财务操作人
+	ErrTransactionStatusInvalid     = errors.New("refund transaction status is invalid")                      // 财务回填状态无效
+	ErrFailureReasonRequired        = errors.New("failure reason is required")                                // 失败回填未提供失败原因
+	ErrRefundRequestNotApproved     = errors.New("refund request is not approved")                            // 退款申请尚未审核通过
+	ErrProviderRefundNoExists       = errors.New("provider refund number already exists")                     // 渠道退款号已经登记
+	ErrIdempotencyKeyRequired       = errors.New("idempotency key is required")                               // 未提供幂等键
+	ErrIdempotencyKeyTooLong        = errors.New("idempotency key must not exceed 255 characters")            // 幂等键超过长度限制
+	ErrIdempotencyKeyConflict       = errors.New("idempotency key was already used with a different request") // 同一幂等键对应不同请求
 )
 
+const createRefundRequestOperation = "refund_request.create"
+
 // Repository 定义退款闭环需要的持久化能力。
-// 当前用内存仓储支撑本地演示，后续可替换为 PostgreSQL。
+// 内存实现用于本地演示和单元测试，PostgreSQL 实现负责生产式事务与并发约束。
 type Repository interface {
 	FindOrderByExternalOrderNo(ctx context.Context, tenantID string, externalOrderNo string) (domain.Order, error)
-	CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog) error
+	FindRefundRequestByIdempotency(ctx context.Context, idempotency IdempotencyRecord) (domain.RefundRequest, bool, error)
+	CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog, idempotency IdempotencyRecord) (CreateRequestPersistenceResult, error)
 	FindRefundRequestByRequestNo(ctx context.Context, tenantID string, requestNo string) (domain.RefundRequest, error)
 	// 根据退款申请编号查询所有审批记录
 	ListApprovalsByRequestNo(ctx context.Context, tenantID string, requestNo string) ([]domain.Approval, error)
@@ -112,6 +122,7 @@ func NewService(repository Repository, highAmountApprovalThreshold int64, clock 
 
 type CreateRequestCommand struct {
 	TenantID        string
+	IdempotencyKey  string
 	ExternalOrderNo string
 	RequestedAmount int64
 	ReasonCode      string
@@ -125,6 +136,26 @@ type RequestDetail struct {
 	RequiresHighAmountApproval bool
 	Approvals                  []domain.Approval
 	RefundTransactions         []domain.RefundTransaction
+	// IdempotencyReplayed 只在创建接口复用首次结果时为 true。
+	IdempotencyReplayed bool
+}
+
+// IdempotencyRecord 描述一次写操作的稳定请求指纹和首次成功结果。
+type IdempotencyRecord struct {
+	ID             string
+	TenantID       string
+	ActorID        string
+	Operation      string
+	Key            string
+	RequestHash    string
+	ResponseStatus int
+	CreatedAt      time.Time
+}
+
+// CreateRequestPersistenceResult 区分首次创建和幂等结果复用。
+type CreateRequestPersistenceResult struct {
+	Request  domain.RefundRequest
+	Replayed bool
 }
 
 // ReviewRequestCommand 只表达业务输入，不承载登录态；当前操作者由上层鉴权层注入。
@@ -172,6 +203,7 @@ func (service *Service) GetOrder(ctx context.Context, tenantID string, externalO
 // CreateRequest 先校验订单资格，再固化订单快照并进入待审状态。
 func (service *Service) CreateRequest(ctx context.Context, command CreateRequestCommand) (RequestDetail, error) {
 	command.TenantID = strings.TrimSpace(command.TenantID)
+	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
 	command.ExternalOrderNo = strings.TrimSpace(command.ExternalOrderNo)
 	command.ReasonCode = strings.TrimSpace(command.ReasonCode)
 	command.ReasonNote = strings.TrimSpace(command.ReasonNote)
@@ -179,6 +211,12 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 
 	if command.TenantID == "" {
 		return RequestDetail{}, ErrTenantRequired
+	}
+	if command.IdempotencyKey == "" {
+		return RequestDetail{}, ErrIdempotencyKeyRequired
+	}
+	if utf8.RuneCountInString(command.IdempotencyKey) > 255 {
+		return RequestDetail{}, ErrIdempotencyKeyTooLong
 	}
 	if command.ExternalOrderNo == "" {
 		return RequestDetail{}, ErrExternalOrderNoRequired
@@ -193,6 +231,29 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 		return RequestDetail{}, ErrSubmittedByRequired
 	}
 
+	requestHash, err := createRequestHash(command)
+	if err != nil {
+		return RequestDetail{}, err
+	}
+	idempotency := IdempotencyRecord{
+		ID:          idempotencyRecordID(command.TenantID, command.SubmittedBy, createRefundRequestOperation, command.IdempotencyKey),
+		TenantID:    command.TenantID,
+		ActorID:     command.SubmittedBy,
+		Operation:   createRefundRequestOperation,
+		Key:         command.IdempotencyKey,
+		RequestHash: requestHash,
+	}
+
+	// 普通重试先读取首次结果，避免重复消耗新的业务单号；并发竞争仍由写事务兜底。
+	existingRequest, found, err := service.repository.FindRefundRequestByIdempotency(ctx, idempotency)
+	if err != nil {
+		return RequestDetail{}, err
+	}
+	if found {
+		return service.createdRequestDetail(existingRequest, true), nil
+	}
+
+	// 只有首次处理才读取实时订单状态；重试必须优先返回首次结果。
 	order, err := service.repository.FindOrderByExternalOrderNo(ctx, command.TenantID, command.ExternalOrderNo)
 	if err != nil {
 		return RequestDetail{}, err
@@ -236,11 +297,59 @@ func (service *Service) CreateRequest(ctx context.Context, command CreateRequest
 		CreatedAt: now,
 	}
 
-	if err := service.repository.CreateRefundRequest(ctx, request, auditLog); err != nil {
+	// 幂等键、退款申请和审计日志由 Repository 在同一临界区或数据库事务内写入。
+	idempotency.ResponseStatus = 201
+	idempotency.CreatedAt = now
+	persistenceResult, err := service.repository.CreateRefundRequest(ctx, request, auditLog, idempotency)
+	if err != nil {
 		return RequestDetail{}, err
 	}
+	if persistenceResult.Replayed {
+		return service.createdRequestDetail(persistenceResult.Request, true), nil
+	}
 
-	return service.detail(ctx, request)
+	// 创建后的响应只包含申请本体和空时间线，直接构造可确保首次和重放响应一致。
+	return service.createdRequestDetail(persistenceResult.Request, false), nil
+}
+
+func (service *Service) createdRequestDetail(request domain.RefundRequest, replayed bool) RequestDetail {
+	return RequestDetail{
+		Request:                    request,
+		RequiresHighAmountApproval: request.RequiresHighAmountApproval(service.highAmountApprovalThreshold),
+		Approvals:                  []domain.Approval{},
+		RefundTransactions:         []domain.RefundTransaction{},
+		IdempotencyReplayed:        replayed,
+	}
+}
+
+func createRequestHash(command CreateRequestCommand) (string, error) {
+	// 使用规范化后的业务字段生成摘要，避免 JSON 字段顺序影响幂等判断。
+	payload := struct {
+		ExternalOrderNo string `json:"external_order_no"`
+		RequestedAmount int64  `json:"requested_amount"`
+		ReasonCode      string `json:"reason_code"`
+		ReasonNote      string `json:"reason_note"`
+		SubmittedBy     string `json:"submitted_by"`
+	}{
+		ExternalOrderNo: command.ExternalOrderNo,
+		RequestedAmount: command.RequestedAmount,
+		ReasonCode:      command.ReasonCode,
+		ReasonNote:      command.ReasonNote,
+		SubmittedBy:     command.SubmittedBy,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal refund request idempotency payload: %w", err)
+	}
+
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+// 根据 tenantID + actorID + operation + key 生成一个稳定、唯一性很高的幂等记录 ID
+func idempotencyRecordID(tenantID, actorID, operation, key string) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{tenantID, actorID, operation, key}, "\x00")))
+	return "idempotency_" + hex.EncodeToString(digest[:])
 }
 
 func (service *Service) GetRequest(ctx context.Context, tenantID string, requestNo string) (RequestDetail, error) {
