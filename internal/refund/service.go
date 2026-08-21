@@ -46,7 +46,10 @@ var (
 	ErrIdempotencyKeyConflict       = errors.New("idempotency key was already used with a different request") // 同一幂等键对应不同请求
 )
 
-const createRefundRequestOperation = "refund_request.create"
+const (
+	createRefundRequestOperation     = "refund_request.create"
+	createRefundTransactionOperation = "refund_transaction.create"
+)
 
 // Repository 定义退款闭环需要的持久化能力。
 // 内存实现用于本地演示和单元测试，PostgreSQL 实现负责生产式事务与并发约束。
@@ -59,7 +62,10 @@ type Repository interface {
 	ListApprovalsByRequestNo(ctx context.Context, tenantID string, requestNo string) ([]domain.Approval, error)
 	ListRefundTransactionsByRequestNo(ctx context.Context, tenantID string, requestNo string) ([]domain.RefundTransaction, error)
 	ReviewRefundRequest(ctx context.Context, tenantID string, requestNo string, approval domain.Approval, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
-	RecordRefundTransaction(ctx context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error)
+	// 根据幂等 Key 查找之前的退款交易；
+	// 找到则返回第一次的结果，如果 Key 相同但请求参数不同，则报幂等冲突
+	FindRefundTransactionByIdempotency(ctx context.Context, idempotency IdempotencyRecord) (TransactionPersistenceResult, bool, error)
+	RecordRefundTransaction(ctx context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog, idempotency IdempotencyRecord) (TransactionPersistenceResult, error)
 }
 
 type Clock interface {
@@ -173,6 +179,7 @@ type ReviewResult struct {
 
 type RecordTransactionCommand struct {
 	TenantID         string
+	IdempotencyKey   string
 	RequestNo        string
 	Provider         string
 	ProviderRefundNo string
@@ -183,8 +190,22 @@ type RecordTransactionCommand struct {
 }
 
 type TransactionResult struct {
-	Request     RequestDetail            // 最新退款申请详情
-	Transaction domain.RefundTransaction // 本次退款交易记录
+	Request             RequestDetail            // 最新退款申请详情
+	Transaction         domain.RefundTransaction // 本次退款交易记录
+	IdempotencyReplayed bool                     // 是否复用首次财务回填结果
+}
+
+// TransactionPersistenceResult 是财务回填事务的持久化结果。
+type TransactionPersistenceResult struct {
+	Request     domain.RefundRequest
+	Transaction domain.RefundTransaction
+	Replayed    bool
+}
+
+// transactionIdempotencyResponse 是保存到 response_data 的稳定响应结构。
+type transactionIdempotencyResponse struct {
+	Request     domain.RefundRequest     `json:"request"`
+	Transaction domain.RefundTransaction `json:"transaction"`
 }
 
 func (service *Service) GetOrder(ctx context.Context, tenantID string, externalOrderNo string) (domain.Order, error) {
@@ -381,6 +402,7 @@ func (service *Service) RejectRequest(ctx context.Context, command ReviewRequest
 // RecordTransaction 记录财务人工退款结果；只有已审批通过的申请才能结案。
 func (service *Service) RecordTransaction(ctx context.Context, command RecordTransactionCommand) (TransactionResult, error) {
 	command.TenantID = strings.TrimSpace(command.TenantID)
+	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
 	command.RequestNo = strings.TrimSpace(command.RequestNo)
 	command.Provider = strings.TrimSpace(command.Provider)
 	command.ProviderRefundNo = strings.TrimSpace(command.ProviderRefundNo)
@@ -389,6 +411,12 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 
 	if command.TenantID == "" {
 		return TransactionResult{}, ErrTenantRequired
+	}
+	if command.IdempotencyKey == "" {
+		return TransactionResult{}, ErrIdempotencyKeyRequired
+	}
+	if utf8.RuneCountInString(command.IdempotencyKey) > 255 {
+		return TransactionResult{}, ErrIdempotencyKeyTooLong
 	}
 	if command.RequestNo == "" {
 		return TransactionResult{}, ErrTransactionRequestNoRequired
@@ -412,6 +440,31 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		return TransactionResult{}, ErrFailureReasonRequired
 	}
 
+	requestHash, err := recordTransactionHash(command)
+	if err != nil {
+		return TransactionResult{}, err
+	}
+	// 构建这次请求的幂等身份
+	idempotency := IdempotencyRecord{
+		ID:          idempotencyRecordID(command.TenantID, command.ProcessedBy, createRefundTransactionOperation, command.IdempotencyKey),
+		TenantID:    command.TenantID,
+		ActorID:     command.ProcessedBy,
+		Operation:   createRefundTransactionOperation,
+		Key:         command.IdempotencyKey,
+		RequestHash: requestHash,
+	}
+
+	// 财务重试必须优先返回首次结果，不能被已经结案后的状态校验拦截。
+	existingResult, found, err := service.repository.FindRefundTransactionByIdempotency(ctx, idempotency)
+	if err != nil {
+		return TransactionResult{}, err
+	}
+	// 如果已经被处理过，就返回第一次的结果
+	if found {
+		return service.transactionResult(ctx, existingResult)
+	}
+
+	// 业务状态校验 + 金额一致性校验
 	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.TenantID, command.RequestNo)
 	if err != nil {
 		return TransactionResult{}, err
@@ -466,17 +519,57 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		CreatedAt: now,
 	}
 
-	updatedRequest, err := service.repository.RecordRefundTransaction(ctx, command.TenantID, request.RequestNo, transaction, requestStatus, auditLog)
+	// 幂等记录、状态更新、交易记录和审计日志必须原子提交。
+	idempotency.ResponseStatus = 200
+	idempotency.CreatedAt = now
+	persistenceResult, err := service.repository.RecordRefundTransaction(ctx, command.TenantID, request.RequestNo, transaction, requestStatus, auditLog, idempotency)
 	if err != nil {
 		return TransactionResult{}, err
 	}
 
-	detail, err := service.detail(ctx, updatedRequest)
+	return service.transactionResult(ctx, persistenceResult)
+}
+
+func (service *Service) transactionResult(ctx context.Context, persistenceResult TransactionPersistenceResult) (TransactionResult, error) {
+	detail, err := service.detail(ctx, persistenceResult.Request)
 	if err != nil {
 		return TransactionResult{}, err
 	}
 
-	return TransactionResult{Request: detail, Transaction: transaction}, nil
+	return TransactionResult{
+		Request:             detail,
+		Transaction:         persistenceResult.Transaction,
+		IdempotencyReplayed: persistenceResult.Replayed,
+	}, nil
+}
+
+// 根据 command 计算一个 requestHash
+func recordTransactionHash(command RecordTransactionCommand) (string, error) {
+	// 摘要覆盖所有会影响退款结果的业务字段，防止同一键复用不同回填内容。
+	payload := struct {
+		RequestNo        string                         `json:"request_no"`
+		Provider         string                         `json:"provider"`
+		ProviderRefundNo string                         `json:"provider_refund_no"`
+		Amount           int64                          `json:"amount"`
+		Status           domain.RefundTransactionStatus `json:"status"`
+		FailureReason    string                         `json:"failure_reason"`
+		ProcessedBy      string                         `json:"processed_by"`
+	}{
+		RequestNo:        command.RequestNo,
+		Provider:         command.Provider,
+		ProviderRefundNo: command.ProviderRefundNo,
+		Amount:           command.Amount,
+		Status:           command.Status,
+		FailureReason:    command.FailureReason,
+		ProcessedBy:      command.ProcessedBy,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal refund transaction idempotency payload: %w", err)
+	}
+
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
 // reviewRequest 让通过和驳回共享同一套校验，避免重复处理审批人、状态和备注。

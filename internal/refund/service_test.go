@@ -15,9 +15,10 @@ type fixedClock struct {
 }
 
 const (
-	demoTenantID       = "tenant_demo"
-	acmeTenantID       = "tenant_acme"
-	testIdempotencyKey = "test-refund-create"
+	demoTenantID                  = "tenant_demo"
+	acmeTenantID                  = "tenant_acme"
+	testIdempotencyKey            = "test-refund-create"
+	testTransactionIdempotencyKey = "test-refund-transaction"
 )
 
 func (clock fixedClock) Now() time.Time {
@@ -549,6 +550,7 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 
 	result, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
 		TenantID:         demoTenantID,
+		IdempotencyKey:   testTransactionIdempotencyKey,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -570,6 +572,155 @@ func TestRecordTransactionTransitionsApprovedRequestToSucceeded(t *testing.T) {
 	}
 	if len(result.Request.RefundTransactions) != 1 {
 		t.Fatalf("RefundTransactions length = %d, want 1", len(result.Request.RefundTransactions))
+	}
+	if len(repository.AuditLogs()) != 3 {
+		t.Fatalf("AuditLogs length = %d, want 3", len(repository.AuditLogs()))
+	}
+}
+
+func TestRecordTransactionRequiresIdempotencyKey(t *testing.T) {
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())
+
+	_, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
+		TenantID:         demoTenantID,
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI202608040001",
+		Amount:           12_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_finance_001",
+	})
+	if !errors.Is(err, ErrIdempotencyKeyRequired) {
+		t.Fatalf("RecordTransaction() error = %v, want %v", err, ErrIdempotencyKeyRequired)
+	}
+}
+
+func TestRecordTransactionReplaysFirstResult(t *testing.T) {
+	service, repository := newApprovedRefundService(t)
+	command := RecordTransactionCommand{
+		TenantID:         demoTenantID,
+		IdempotencyKey:   "refund-transaction-replay",
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI-REPLAY-001",
+		Amount:           12_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_finance_001",
+	}
+
+	first, err := service.RecordTransaction(context.Background(), command)
+	if err != nil {
+		t.Fatalf("first RecordTransaction() error = %v", err)
+	}
+	second, err := service.RecordTransaction(context.Background(), command)
+	if err != nil {
+		t.Fatalf("second RecordTransaction() error = %v", err)
+	}
+
+	if first.IdempotencyReplayed {
+		t.Fatalf("first IdempotencyReplayed = true, want false")
+	}
+	if !second.IdempotencyReplayed {
+		t.Fatalf("second IdempotencyReplayed = false, want true")
+	}
+	if second.Transaction.ID != first.Transaction.ID {
+		t.Fatalf("transaction IDs = %q and %q, want same", first.Transaction.ID, second.Transaction.ID)
+	}
+	if len(second.Request.RefundTransactions) != 1 {
+		t.Fatalf("RefundTransactions length = %d, want 1", len(second.Request.RefundTransactions))
+	}
+	if len(repository.AuditLogs()) != 3 {
+		t.Fatalf("AuditLogs length = %d, want 3", len(repository.AuditLogs()))
+	}
+}
+
+func TestRecordTransactionRejectsIdempotencyKeyWithDifferentPayload(t *testing.T) {
+	service, _ := newApprovedRefundService(t)
+	command := RecordTransactionCommand{
+		TenantID:         demoTenantID,
+		IdempotencyKey:   "refund-transaction-conflict",
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI-CONFLICT-001",
+		Amount:           12_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_finance_001",
+	}
+
+	if _, err := service.RecordTransaction(context.Background(), command); err != nil {
+		t.Fatalf("first RecordTransaction() error = %v", err)
+	}
+	command.ProviderRefundNo = "ALI-CONFLICT-002"
+	_, err := service.RecordTransaction(context.Background(), command)
+	if !errors.Is(err, ErrIdempotencyKeyConflict) {
+		t.Fatalf("second RecordTransaction() error = %v, want %v", err, ErrIdempotencyKeyConflict)
+	}
+}
+
+func TestRecordTransactionConcurrentRetriesWriteOnce(t *testing.T) {
+	service, repository := newApprovedRefundService(t)
+	command := RecordTransactionCommand{
+		TenantID:         demoTenantID,
+		IdempotencyKey:   "refund-transaction-concurrent",
+		RequestNo:        "RR202608040001",
+		Provider:         "alipay",
+		ProviderRefundNo: "ALI-CONCURRENT-001",
+		Amount:           12_900,
+		Status:           domain.RefundTransactionStatusSucceeded,
+		ProcessedBy:      "user_finance_001",
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan TransactionResult, workers)
+	errorsByWorker := make(chan error, workers)
+	var waitGroup sync.WaitGroup
+	for range workers {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			result, err := service.RecordTransaction(context.Background(), command)
+			if err != nil {
+				errorsByWorker <- err
+				return
+			}
+			results <- result
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	close(errorsByWorker)
+
+	for err := range errorsByWorker {
+		t.Fatalf("concurrent RecordTransaction() error = %v", err)
+	}
+	firstResultCount := 0
+	resultCount := 0
+	transactionID := ""
+	for result := range results {
+		resultCount++
+		if transactionID == "" {
+			transactionID = result.Transaction.ID
+		}
+		if result.Transaction.ID != transactionID {
+			t.Fatalf("Transaction.ID = %q, want %q", result.Transaction.ID, transactionID)
+		}
+		if !result.IdempotencyReplayed {
+			firstResultCount++
+		}
+	}
+	if resultCount != workers {
+		t.Fatalf("result count = %d, want %d", resultCount, workers)
+	}
+	if firstResultCount != 1 {
+		t.Fatalf("first result count = %d, want 1", firstResultCount)
+	}
+	requestKey := tenantKey(demoTenantID, command.RequestNo)
+	if len(repository.transactions[requestKey]) != 1 {
+		t.Fatalf("transaction count = %d, want 1", len(repository.transactions[requestKey]))
 	}
 	if len(repository.AuditLogs()) != 3 {
 		t.Fatalf("AuditLogs length = %d, want 3", len(repository.AuditLogs()))
@@ -600,13 +751,14 @@ func TestRecordTransactionTransitionsApprovedRequestToFailed(t *testing.T) {
 	}
 
 	result, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
-		TenantID:      demoTenantID,
-		RequestNo:     "RR202608040001",
-		Provider:      "alipay",
-		Amount:        12_900,
-		Status:        domain.RefundTransactionStatusFailed,
-		FailureReason: "支付渠道返回余额不足",
-		ProcessedBy:   "user_finance_001",
+		TenantID:       demoTenantID,
+		IdempotencyKey: testTransactionIdempotencyKey,
+		RequestNo:      "RR202608040001",
+		Provider:       "alipay",
+		Amount:         12_900,
+		Status:         domain.RefundTransactionStatusFailed,
+		FailureReason:  "支付渠道返回余额不足",
+		ProcessedBy:    "user_finance_001",
 	})
 	if err != nil {
 		t.Fatalf("RecordTransaction() error = %v", err)
@@ -636,6 +788,7 @@ func TestRecordTransactionRejectsPendingReviewRequest(t *testing.T) {
 
 	_, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
 		TenantID:         demoTenantID,
+		IdempotencyKey:   testTransactionIdempotencyKey,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -673,6 +826,7 @@ func TestRecordTransactionRejectsAmountMismatch(t *testing.T) {
 
 	_, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
 		TenantID:         demoTenantID,
+		IdempotencyKey:   testTransactionIdempotencyKey,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI202608040001",
@@ -722,6 +876,7 @@ func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
 
 	if _, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
 		TenantID:         demoTenantID,
+		IdempotencyKey:   testTransactionIdempotencyKey,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI-SAME-REFUND-NO",
@@ -733,6 +888,7 @@ func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
 	}
 	if _, err := service.RecordTransaction(context.Background(), RecordTransactionCommand{
 		TenantID:         acmeTenantID,
+		IdempotencyKey:   testTransactionIdempotencyKey,
 		RequestNo:        "RR202608040001",
 		Provider:         "alipay",
 		ProviderRefundNo: "ALI-SAME-REFUND-NO",
@@ -742,4 +898,32 @@ func TestRecordTransactionScopesProviderRefundNoByTenant(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("acme RecordTransaction() error = %v", err)
 	}
+}
+
+func newApprovedRefundService(t *testing.T) (*Service, *InMemoryRepository) {
+	t.Helper()
+
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository(DemoOrders())
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
+		ExternalOrderNo: "LD202608040001",
+		RequestedAmount: 12_900,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}); err != nil {
+		t.Fatalf("CreateRequest() error = %v", err)
+	}
+	if _, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:   demoTenantID,
+		RequestNo:  "RR202608040001",
+		DecisionBy: "user_supervisor_001",
+		Comment:    "订单未发货，符合退款规则",
+	}); err != nil {
+		t.Fatalf("ApproveRequest() error = %v", err)
+	}
+
+	return service, repository
 }

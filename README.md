@@ -77,6 +77,7 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/approve \
 
 curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactions \
   -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: refund-transaction-demo-001' \
   -H "Authorization: Bearer $FINANCE_TOKEN" \
   -d '{
     "provider": "alipay",
@@ -95,9 +96,10 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 
 - 已完成：订单查询、退款申请创建、退款审核通过/驳回、财务人工退款回填、成功/失败结案。
 - 已完成：退款申请创建接口的 `Idempotency-Key`、请求摘要校验、首次结果复用和并发重复提交防护。
+- 已完成：财务退款回填接口的 `Idempotency-Key`、请求摘要校验、首次结果复用和并发重复提交防护。
 - 已完成：PostgreSQL Auth Session、Bearer Token、密码哈希、RBAC 权限校验和租户数据隔离。
 - 已完成：PostgreSQL 退款仓储、核心 schema、本地演示 seed 和初始化脚本。
-- 下一步：为财务退款回填增加 `Idempotency-Key`，并补齐高金额两级审批等剩余业务规则。
+- 下一步：补齐高金额两级审批、仓配确认、失败重试和取消等剩余业务规则。
 
 ### 创建退款申请的幂等规则
 
@@ -108,6 +110,17 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 - 重放响应会携带 `Idempotency-Replayed: true`。
 - 相同幂等键携带不同业务参数时返回 `409 idempotency_key_conflict`。
 - PostgreSQL 会在同一事务内写入幂等记录、退款申请和审计日志，避免并发重复创建。
+
+### 财务退款回填的幂等规则
+
+`POST /refund-requests/{request_no}/refund-transactions` 同样必须携带 `Idempotency-Key`：
+
+- 幂等作用域为当前租户、当前财务操作人和“退款回填”操作。
+- 请求摘要包含申请号、退款渠道、渠道退款号、金额、成功/失败状态、失败原因和操作人。
+- 相同幂等键与相同回填参数重复提交时，不会重复写入退款交易或审计日志，而是返回首次结果。
+- 重放响应会携带 `Idempotency-Replayed: true`。
+- 相同幂等键携带不同回填参数时返回 `409 idempotency_key_conflict`。
+- PostgreSQL 会在同一事务内锁定退款申请，并写入幂等记录、状态更新、退款交易和审计日志。
 
 如需使用本地配置文件：
 

@@ -28,6 +28,7 @@ type InMemoryRepository struct {
 type memoryIdempotencyRecord struct {
 	RequestHash string
 	Request     domain.RefundRequest
+	Transaction domain.RefundTransaction
 }
 
 func NewInMemoryRepository(orders []domain.Order) *InMemoryRepository {
@@ -128,6 +129,25 @@ func (repository *InMemoryRepository) FindRefundRequestByIdempotency(_ context.C
 	}
 
 	return existing.Request, true, nil
+}
+
+func (repository *InMemoryRepository) FindRefundTransactionByIdempotency(_ context.Context, idempotency IdempotencyRecord) (TransactionPersistenceResult, bool, error) {
+	repository.mutex.RLock()
+	defer repository.mutex.RUnlock()
+
+	existing, ok := repository.idempotencyRecords[idempotencyScopeKey(idempotency)]
+	if !ok {
+		return TransactionPersistenceResult{}, false, nil
+	}
+	if existing.RequestHash != idempotency.RequestHash {
+		return TransactionPersistenceResult{}, false, ErrIdempotencyKeyConflict
+	}
+
+	return TransactionPersistenceResult{
+		Request:     existing.Request,
+		Transaction: existing.Transaction,
+		Replayed:    true,
+	}, true, nil
 }
 
 func (repository *InMemoryRepository) CreateRefundRequest(_ context.Context, request domain.RefundRequest, auditLog domain.AuditLog, idempotency IdempotencyRecord) (CreateRequestPersistenceResult, error) {
@@ -237,22 +257,34 @@ func (repository *InMemoryRepository) ListRefundTransactionsByRequestNo(_ contex
 	return result, nil
 }
 
-func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
+func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog, idempotency IdempotencyRecord) (TransactionPersistenceResult, error) {
 	repository.mutex.Lock()
 	defer repository.mutex.Unlock()
+
+	idempotencyKey := idempotencyScopeKey(idempotency)
+	if existing, ok := repository.idempotencyRecords[idempotencyKey]; ok {
+		if existing.RequestHash != idempotency.RequestHash {
+			return TransactionPersistenceResult{}, ErrIdempotencyKeyConflict
+		}
+		return TransactionPersistenceResult{
+			Request:     existing.Request,
+			Transaction: existing.Transaction,
+			Replayed:    true,
+		}, nil
+	}
 
 	key := tenantKey(tenantID, requestNo)
 	request, ok := repository.requests[key]
 	if !ok {
-		return domain.RefundRequest{}, ErrRefundRequestNotFound
+		return TransactionPersistenceResult{}, ErrRefundRequestNotFound
 	}
 	if request.Status != domain.RefundRequestStatusApproved {
-		return domain.RefundRequest{}, ErrRefundRequestNotApproved
+		return TransactionPersistenceResult{}, ErrRefundRequestNotApproved
 	}
 	if transaction.ProviderRefundNo != "" {
 		providerKey := tenantProviderRefundKey(tenantID, transaction.Provider, transaction.ProviderRefundNo)
 		if _, exists := repository.providerRefundNo[providerKey]; exists {
-			return domain.RefundRequest{}, ErrProviderRefundNoExists
+			return TransactionPersistenceResult{}, ErrProviderRefundNoExists
 		}
 		repository.providerRefundNo[providerKey] = key
 	}
@@ -261,8 +293,13 @@ func (repository *InMemoryRepository) RecordRefundTransaction(_ context.Context,
 	repository.requests[key] = request
 	repository.transactions[key] = append(repository.transactions[key], transaction)
 	repository.auditLogList = append(repository.auditLogList, auditLog)
+	repository.idempotencyRecords[idempotencyKey] = memoryIdempotencyRecord{
+		RequestHash: idempotency.RequestHash,
+		Request:     request,
+		Transaction: transaction,
+	}
 
-	return request, nil
+	return TransactionPersistenceResult{Request: request, Transaction: transaction}, nil
 }
 
 // 将租户ID和业务编号组合成一个Key

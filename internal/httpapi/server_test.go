@@ -18,9 +18,10 @@ type fixedHTTPClock struct {
 }
 
 const (
-	demoTenantID       = "tenant_demo"
-	acmeTenantID       = "tenant_acme"
-	testIdempotencyKey = "test-refund-create"
+	demoTenantID                  = "tenant_demo"
+	acmeTenantID                  = "tenant_acme"
+	testIdempotencyKey            = "test-refund-create"
+	testTransactionIdempotencyKey = "test-refund-transaction"
 )
 
 type defaultTenantHandler struct {
@@ -340,6 +341,7 @@ func TestRefundFlowWithLoginAndRBAC(t *testing.T) {
   "status": "SUCCEEDED"
 }`))
 	transactionRequest.Header.Set("Authorization", "Bearer "+financeToken)
+	transactionRequest.Header.Set("Idempotency-Key", testTransactionIdempotencyKey)
 	transactionResponse := httptest.NewRecorder()
 	handler.ServeHTTP(transactionResponse, transactionRequest)
 	if transactionResponse.Code != http.StatusOK {
@@ -427,6 +429,7 @@ func TestRecordRefundTransaction(t *testing.T) {
   "status": "SUCCEEDED"
 }`))
 	transactionRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	transactionRequest.Header.Set("Idempotency-Key", testTransactionIdempotencyKey)
 	transactionResponse := httptest.NewRecorder()
 
 	handler.ServeHTTP(transactionResponse, transactionRequest)
@@ -461,6 +464,101 @@ func TestRecordRefundTransaction(t *testing.T) {
 	}
 }
 
+func TestRecordRefundTransactionRequiresIdempotencyKey(t *testing.T) {
+	handler := newTestHandler()
+	createApprovedRefundRequest(t, handler)
+	request := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI-MISSING-KEY-001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	request.Header.Set("X-Actor-ID", "user_finance_001")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestRecordRefundTransactionReplaysFirstResponse(t *testing.T) {
+	handler := newTestHandler()
+	createApprovedRefundRequest(t, handler)
+	body := `{
+  "provider": "alipay",
+  "provider_refund_no": "ALI-HTTP-REPLAY-001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`
+
+	firstRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(body))
+	firstRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	firstRequest.Header.Set("Idempotency-Key", "http-transaction-replay")
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, firstRequest)
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d, body = %s", firstResponse.Code, http.StatusOK, firstResponse.Body.String())
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(body))
+	secondRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	secondRequest.Header.Set("Idempotency-Key", "http-transaction-replay")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, secondRequest)
+	if secondResponse.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d, body = %s", secondResponse.Code, http.StatusOK, secondResponse.Body.String())
+	}
+	if secondResponse.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("Idempotency-Replayed = %q, want true", secondResponse.Header().Get("Idempotency-Replayed"))
+	}
+
+	var firstBody, secondBody transactionResultResponse
+	if err := json.NewDecoder(firstResponse.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if err := json.NewDecoder(secondResponse.Body).Decode(&secondBody); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if firstBody.Transaction.ID != secondBody.Transaction.ID {
+		t.Fatalf("transaction IDs = %q and %q, want same", firstBody.Transaction.ID, secondBody.Transaction.ID)
+	}
+}
+
+func TestRecordRefundTransactionRejectsIdempotencyKeyConflict(t *testing.T) {
+	handler := newTestHandler()
+	createApprovedRefundRequest(t, handler)
+	firstRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI-HTTP-CONFLICT-001",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	firstRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	firstRequest.Header.Set("Idempotency-Key", "http-transaction-conflict")
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, firstRequest)
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d, body = %s", firstResponse.Code, http.StatusOK, firstResponse.Body.String())
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider": "alipay",
+  "provider_refund_no": "ALI-HTTP-CONFLICT-002",
+  "amount": 12900,
+  "status": "SUCCEEDED"
+}`))
+	secondRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	secondRequest.Header.Set("Idempotency-Key", "http-transaction-conflict")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, secondRequest)
+
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("second status = %d, want %d, body = %s", secondResponse.Code, http.StatusConflict, secondResponse.Body.String())
+	}
+}
+
 func TestRecordRefundTransactionRejectsPendingReviewRequest(t *testing.T) {
 	handler := newTestHandler()
 	createBody := strings.NewReader(`{
@@ -481,6 +579,7 @@ func TestRecordRefundTransactionRejectsPendingReviewRequest(t *testing.T) {
   "status": "SUCCEEDED"
 }`))
 	transactionRequest.Header.Set("X-Actor-ID", "user_finance_001")
+	transactionRequest.Header.Set("Idempotency-Key", testTransactionIdempotencyKey)
 	transactionResponse := httptest.NewRecorder()
 
 	handler.ServeHTTP(transactionResponse, transactionRequest)

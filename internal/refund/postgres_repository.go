@@ -71,6 +71,35 @@ WHERE tenant_id = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = 
 	return existingRequest, true, nil
 }
 
+func (repository *PostgresRepository) FindRefundTransactionByIdempotency(ctx context.Context, idempotency IdempotencyRecord) (TransactionPersistenceResult, bool, error) {
+	var existingHash string
+	var responseData []byte
+	err := repository.db.QueryRowContext(ctx, `
+SELECT request_hash, response_data
+FROM idempotency_records
+WHERE tenant_id = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = $4
+`, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key).Scan(&existingHash, &responseData)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TransactionPersistenceResult{}, false, nil
+	}
+	if err != nil {
+		return TransactionPersistenceResult{}, false, err
+	}
+	if existingHash != idempotency.RequestHash {
+		return TransactionPersistenceResult{}, false, ErrIdempotencyKeyConflict
+	}
+
+	var response transactionIdempotencyResponse
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		return TransactionPersistenceResult{}, false, fmt.Errorf("unmarshal transaction idempotency response: %w", err)
+	}
+	return TransactionPersistenceResult{
+		Request:     response.Request,
+		Transaction: response.Transaction,
+		Replayed:    true,
+	}, true, nil
+}
+
 func (repository *PostgresRepository) CreateRefundRequest(ctx context.Context, request domain.RefundRequest, auditLog domain.AuditLog, idempotency IdempotencyRecord) (CreateRequestPersistenceResult, error) {
 	var result CreateRequestPersistenceResult
 	err := repository.withTx(ctx, func(tx *sql.Tx) error {
@@ -290,9 +319,10 @@ WHERE tenant_id = $3 AND request_no = $4
 	return updatedRequest, nil
 }
 
-func (repository *PostgresRepository) RecordRefundTransaction(ctx context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog) (domain.RefundRequest, error) {
-	var updatedRequest domain.RefundRequest
+func (repository *PostgresRepository) RecordRefundTransaction(ctx context.Context, tenantID string, requestNo string, transaction domain.RefundTransaction, requestStatus domain.RefundRequestStatus, auditLog domain.AuditLog, idempotency IdempotencyRecord) (TransactionPersistenceResult, error) {
+	var result TransactionPersistenceResult
 	err := repository.withTx(ctx, func(tx *sql.Tx) error {
+		// FOR UPDATE 表示吧这条退款申请的数据库行锁住
 		request, err := scanRefundRequest(tx.QueryRowContext(ctx, `
 SELECT id, tenant_id, request_no, order_id, order_snapshot, requested_amount,
        reason_code, reason_note, status, submitted_by, submitted_at
@@ -306,6 +336,61 @@ FOR UPDATE
 		if err != nil {
 			return err
 		}
+
+		responseRequest := request
+		responseRequest.Status = requestStatus
+		responseData, err := json.Marshal(transactionIdempotencyResponse{
+			Request:     responseRequest,
+			Transaction: transaction,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal transaction idempotency response: %w", err)
+		}
+
+		// 先锁定退款申请，再占用幂等键，确保并发回填只会有一个事务继续写入。
+		// 通过 ON CONFLICT ... DO NOTHING 来尝试‘抢占‘这个 IdempotencyKey
+		insertResult, err := tx.ExecContext(ctx, `
+INSERT INTO idempotency_records (
+    id, tenant_id, actor_id, operation, idempotency_key, request_hash,
+    status, response_status, response_data, resource_type, resource_id,
+    created_at, completed_at
+) VALUES ($1, $2, $3, $4, $5, $6, 'COMPLETED', $7, $8, 'refund_transaction', $9, $10, $10)
+ON CONFLICT (tenant_id, actor_id, operation, idempotency_key) DO NOTHING
+`, idempotency.ID, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key, idempotency.RequestHash, idempotency.ResponseStatus, responseData, transaction.ID, idempotency.CreatedAt)
+		if err != nil {
+			return err
+		}
+		// 通过 RowAffected的结果判断是否抢占成功；0失败，1成功
+		rowsAffected, err := insertResult.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			var existingHash string
+			var existingResponse []byte
+			if err := tx.QueryRowContext(ctx, `
+SELECT request_hash, response_data
+FROM idempotency_records
+WHERE tenant_id = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = $4
+`, idempotency.TenantID, idempotency.ActorID, idempotency.Operation, idempotency.Key).Scan(&existingHash, &existingResponse); err != nil {
+				return err
+			}
+			if existingHash != idempotency.RequestHash {
+				return ErrIdempotencyKeyConflict
+			}
+
+			var response transactionIdempotencyResponse
+			if err := json.Unmarshal(existingResponse, &response); err != nil {
+				return fmt.Errorf("unmarshal transaction idempotency response: %w", err)
+			}
+			result = TransactionPersistenceResult{
+				Request:     response.Request,
+				Transaction: response.Transaction,
+				Replayed:    true,
+			}
+			return nil
+		}
+
 		if request.Status != domain.RefundRequestStatusApproved {
 			return ErrRefundRequestNotApproved
 		}
@@ -328,14 +413,14 @@ WHERE tenant_id = $3 AND request_no = $4
 			return err
 		}
 
-		updatedRequest = request
+		result = TransactionPersistenceResult{Request: request, Transaction: transaction}
 		return nil
 	})
 	if err != nil {
-		return domain.RefundRequest{}, err
+		return TransactionPersistenceResult{}, err
 	}
 
-	return updatedRequest, nil
+	return result, nil
 }
 
 // 开启事务、执行回调、成功提交、失败回滚

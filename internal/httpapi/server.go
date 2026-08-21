@@ -319,6 +319,7 @@ func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc 
 
 		result, err := refunds.RecordTransaction(request.Context(), apprefund.RecordTransactionCommand{
 			TenantID:         currentTenantID(request),
+			IdempotencyKey:   request.Header.Get("Idempotency-Key"),
 			RequestNo:        request.PathValue("request_no"),
 			Provider:         body.Provider,
 			ProviderRefundNo: body.ProviderRefundNo,
@@ -332,6 +333,10 @@ func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc 
 			return
 		}
 
+		if result.IdempotencyReplayed {
+			// 与创建退款申请保持一致，重放时显式告知客户端。
+			writer.Header().Set("Idempotency-Replayed", "true")
+		}
 		writeJSON(writer, http.StatusOK, transactionResultResponse{
 			Request:     newRefundRequestResponse(result.Request),
 			Transaction: newRefundTransactionResponse(result.Transaction),
