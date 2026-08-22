@@ -49,6 +49,10 @@ FINANCE_TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"finance@lindesk.local","password":"password123"}' | jq -r .token)
 
+FINANCE_SUPERVISOR_TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"finance.supervisor@lindesk.local","password":"password123"}' | jq -r .token)
+
 curl http://localhost:8080/orders/LD202608040001 \
   -H "Authorization: Bearer $CS_TOKEN"
 
@@ -89,7 +93,7 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 
 内置演示租户与订单：
 
-- `tenant_demo`：`LD202608040001` 已支付、未发货，可退 `12900`；`LD202608040002` 已发货；`LD202608040003` 未支付。
+- `tenant_demo`：`LD202608040001` 已支付、未发货，可退 `12900`；`LD202608040002` 已发货；`LD202608040003` 未支付；`LD202608040004` 已支付、未发货，可退 `60000`，用于验证高金额两级审批。
 - `tenant_acme`：也有 `LD202608040001`，但可退金额是 `25900`，用于验证相同外部订单号在不同租户下不会串数据。
 
 ## 当前进度
@@ -99,7 +103,17 @@ curl -X POST http://localhost:8080/refund-requests/$REQUEST_NO/refund-transactio
 - 已完成：财务退款回填接口的 `Idempotency-Key`、请求摘要校验、首次结果复用和并发重复提交防护。
 - 已完成：PostgreSQL Auth Session、Bearer Token、密码哈希、RBAC 权限校验和租户数据隔离。
 - 已完成：PostgreSQL 退款仓储、核心 schema、本地演示 seed 和初始化脚本。
-- 下一步：补齐高金额两级审批、仓配确认、失败重试和取消等剩余业务规则。
+- 已完成：达到配置阈值的高金额退款需要客服主管一级审批和财务主管二级审批，二级通过前禁止财务回填。
+- 下一步：补齐仓配确认、失败重试和取消等剩余业务规则。
+
+### 高金额退款审批规则
+
+- 默认阈值为 `50,000` 分，可通过 `refund.high_amount_approval_threshold` 配置。
+- 普通退款由客服主管一级审批通过后直接进入 `APPROVED`。
+- 高金额退款一级审批通过后仍保持 `PENDING_REVIEW`，等待财务主管二级审批。
+- 财务主管二级审批通过后才进入 `APPROVED`，此时财务人员才能回填退款结果。
+- 审批必须按一级、二级顺序执行，同一操作人不能重复审批同一申请。
+- 审批接口可传 `approval_level` 指定级别；仅有一级权限或仅有二级权限的角色仍会受到权限校验，同时拥有两类权限的企业管理员可显式传 `1` 或 `2`。
 
 ### 创建退款申请的幂等规则
 

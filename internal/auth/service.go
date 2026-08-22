@@ -278,10 +278,12 @@ func DemoUsers(now time.Time) []domain.User {
 		{ID: "user_cs_001", Name: "客服一号", Email: "cs@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_supervisor_001", Name: "主管一号", Email: "supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_finance_001", Name: "财务一号", Email: "finance@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
+		{ID: "user_finance_supervisor_001", Name: "财务主管一号", Email: "finance.supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_admin_001", Name: "管理员一号", Email: "admin@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_acme_cs_001", Name: "Acme 客服一号", Email: "acme.cs@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_acme_supervisor_001", Name: "Acme 主管一号", Email: "acme.supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 		{ID: "user_acme_finance_001", Name: "Acme 财务一号", Email: "acme.finance@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
+		{ID: "user_acme_finance_supervisor_001", Name: "Acme 财务主管一号", Email: "acme.finance.supervisor@lindesk.local", PasswordHash: passwordHash, Status: domain.UserStatusActive, CreatedAt: now},
 	}
 }
 
@@ -314,6 +316,14 @@ func DemoRoles() []domain.Role {
 			},
 		},
 		{
+			Code: domain.RoleFinanceSupervisor,
+			Name: "财务主管",
+			Permissions: []domain.Permission{
+				domain.PermissionRefundRequestRead,
+				domain.PermissionRefundRequestHighAmountReview,
+			},
+		},
+		{
 			Code: domain.RoleTenantAdmin,
 			Name: "企业管理员",
 			Permissions: []domain.Permission{
@@ -321,6 +331,7 @@ func DemoRoles() []domain.Role {
 				domain.PermissionRefundRequestCreate,
 				domain.PermissionRefundRequestRead,
 				domain.PermissionRefundRequestReview,
+				domain.PermissionRefundRequestHighAmountReview,
 				domain.PermissionRefundTransactionWrite,
 				domain.PermissionTenantMemberManage,
 			},
@@ -333,9 +344,11 @@ func DemoMemberships(now time.Time) []domain.TenantMember {
 		{TenantID: "tenant_demo", UserID: "user_cs_001", RoleCode: domain.RoleCustomerService, JoinedAt: now},
 		{TenantID: "tenant_demo", UserID: "user_supervisor_001", RoleCode: domain.RoleSupervisor, JoinedAt: now},
 		{TenantID: "tenant_demo", UserID: "user_finance_001", RoleCode: domain.RoleFinance, JoinedAt: now},
+		{TenantID: "tenant_demo", UserID: "user_finance_supervisor_001", RoleCode: domain.RoleFinanceSupervisor, JoinedAt: now},
 		{TenantID: "tenant_demo", UserID: "user_admin_001", RoleCode: domain.RoleTenantAdmin, JoinedAt: now},
 		{TenantID: "tenant_acme", UserID: "user_acme_cs_001", RoleCode: domain.RoleCustomerService, JoinedAt: now},
 		{TenantID: "tenant_acme", UserID: "user_acme_supervisor_001", RoleCode: domain.RoleSupervisor, JoinedAt: now},
 		{TenantID: "tenant_acme", UserID: "user_acme_finance_001", RoleCode: domain.RoleFinance, JoinedAt: now},
+		{TenantID: "tenant_acme", UserID: "user_acme_finance_supervisor_001", RoleCode: domain.RoleFinanceSupervisor, JoinedAt: now},
 	}
 }

@@ -16,34 +16,38 @@ import (
 )
 
 var (
-	ErrOrderNotFound                = errors.New("order not found")                                           // 订单不存在
-	ErrRefundRequestNotFound        = errors.New("refund request not found")                                  // 退款申请不存在
-	ErrTenantRequired               = errors.New("tenant is required")                                        // 未指定租户
-	ErrExternalOrderNoRequired      = errors.New("external order number is required")                         // 未提供外部订单号
-	ErrRequestedAmountPositive      = errors.New("requested amount must be positive")                         // 申请金额必须大于零
-	ErrReasonCodeRequired           = errors.New("reason code is required")                                   // 未提供退款原因码
-	ErrSubmittedByRequired          = errors.New("submitted by is required")                                  // 未提供申请提交人
-	ErrOrderNotRefundable           = errors.New("order is not eligible for unshipped refund")                // 订单不满足未发货退款条件
-	ErrAmountExceedsRefundable      = errors.New("requested amount exceeds refundable amount")                // 申请金额超过可退余额
-	ErrActiveRefundRequestExists    = errors.New("active refund request exists for order")                    // 订单已有进行中的退款申请
-	ErrReviewRequestNoRequired      = errors.New("refund request number is required")                         // 审核时未提供退款申请号
-	ErrApprovalDecisionByRequired   = errors.New("decision by is required")                                   // 未提供审核人
-	ErrApprovalCommentRequired      = errors.New("approval comment is required")                              // 未提供审核意见
-	ErrRefundRequestNotReviewable   = errors.New("refund request is not pending review")                      // 退款申请不在待审核状态
-	ErrApprovalActorSameAsSubmitter = errors.New("approver cannot be the submitter")                          // 提交人不能审核本人申请
-	ErrTransactionRequestNoRequired = errors.New("refund request number is required")                         // 财务回填未提供退款申请号
-	ErrTransactionProviderRequired  = errors.New("refund provider is required")                               // 未提供退款渠道
-	ErrProviderRefundNoRequired     = errors.New("provider refund number is required")                        // 成功回填未提供渠道退款号
-	ErrTransactionAmountPositive    = errors.New("refund transaction amount must be positive")                // 财务回填金额必须大于零
-	ErrTransactionAmountMismatch    = errors.New("refund transaction amount must equal approved amount")      // 财务回填金额与批准金额不一致
-	ErrTransactionProcessedByNeeded = errors.New("processed by is required")                                  // 未提供财务操作人
-	ErrTransactionStatusInvalid     = errors.New("refund transaction status is invalid")                      // 财务回填状态无效
-	ErrFailureReasonRequired        = errors.New("failure reason is required")                                // 失败回填未提供失败原因
-	ErrRefundRequestNotApproved     = errors.New("refund request is not approved")                            // 退款申请尚未审核通过
-	ErrProviderRefundNoExists       = errors.New("provider refund number already exists")                     // 渠道退款号已经登记
-	ErrIdempotencyKeyRequired       = errors.New("idempotency key is required")                               // 未提供幂等键
-	ErrIdempotencyKeyTooLong        = errors.New("idempotency key must not exceed 255 characters")            // 幂等键超过长度限制
-	ErrIdempotencyKeyConflict       = errors.New("idempotency key was already used with a different request") // 同一幂等键对应不同请求
+	ErrOrderNotFound                 = errors.New("order not found")                                           // 订单不存在
+	ErrRefundRequestNotFound         = errors.New("refund request not found")                                  // 退款申请不存在
+	ErrTenantRequired                = errors.New("tenant is required")                                        // 未指定租户
+	ErrExternalOrderNoRequired       = errors.New("external order number is required")                         // 未提供外部订单号
+	ErrRequestedAmountPositive       = errors.New("requested amount must be positive")                         // 申请金额必须大于零
+	ErrReasonCodeRequired            = errors.New("reason code is required")                                   // 未提供退款原因码
+	ErrSubmittedByRequired           = errors.New("submitted by is required")                                  // 未提供申请提交人
+	ErrOrderNotRefundable            = errors.New("order is not eligible for unshipped refund")                // 订单不满足未发货退款条件
+	ErrAmountExceedsRefundable       = errors.New("requested amount exceeds refundable amount")                // 申请金额超过可退余额
+	ErrActiveRefundRequestExists     = errors.New("active refund request exists for order")                    // 订单已有进行中的退款申请
+	ErrReviewRequestNoRequired       = errors.New("refund request number is required")                         // 审核时未提供退款申请号
+	ErrApprovalDecisionByRequired    = errors.New("decision by is required")                                   // 未提供审核人
+	ErrApprovalCommentRequired       = errors.New("approval comment is required")                              // 未提供审核意见
+	ErrRefundRequestNotReviewable    = errors.New("refund request is not pending review")                      // 退款申请不在待审核状态
+	ErrApprovalActorSameAsSubmitter  = errors.New("approver cannot be the submitter")                          // 提交人不能审核本人申请
+	ErrApprovalActorAlreadyReviewed  = errors.New("approver cannot approve the same request twice")            // 同一审批人不能重复审批同一申请
+	ErrApprovalLevelInvalid          = errors.New("approval level must be between 1 and 2")                    // 审批级别必须是 1 或 2
+	ErrApprovalLevelMismatch         = errors.New("approval level does not match the next required level")     // 当前审批级别不匹配
+	ErrApprovalLevelAlreadyProcessed = errors.New("approval level has already been processed")                 // 当前审批级别已处理
+	ErrTransactionRequestNoRequired  = errors.New("refund request number is required")                         // 财务回填未提供退款申请号
+	ErrTransactionProviderRequired   = errors.New("refund provider is required")                               // 未提供退款渠道
+	ErrProviderRefundNoRequired      = errors.New("provider refund number is required")                        // 成功回填未提供渠道退款号
+	ErrTransactionAmountPositive     = errors.New("refund transaction amount must be positive")                // 财务回填金额必须大于零
+	ErrTransactionAmountMismatch     = errors.New("refund transaction amount must equal approved amount")      // 财务回填金额与批准金额不一致
+	ErrTransactionProcessedByNeeded  = errors.New("processed by is required")                                  // 未提供财务操作人
+	ErrTransactionStatusInvalid      = errors.New("refund transaction status is invalid")                      // 财务回填状态无效
+	ErrFailureReasonRequired         = errors.New("failure reason is required")                                // 失败回填未提供失败原因
+	ErrRefundRequestNotApproved      = errors.New("refund request is not approved")                            // 退款申请尚未审核通过
+	ErrProviderRefundNoExists        = errors.New("provider refund number already exists")                     // 渠道退款号已经登记
+	ErrIdempotencyKeyRequired        = errors.New("idempotency key is required")                               // 未提供幂等键
+	ErrIdempotencyKeyTooLong         = errors.New("idempotency key must not exceed 255 characters")            // 幂等键超过长度限制
+	ErrIdempotencyKeyConflict        = errors.New("idempotency key was already used with a different request") // 同一幂等键对应不同请求
 )
 
 const (
@@ -166,10 +170,11 @@ type CreateRequestPersistenceResult struct {
 
 // ReviewRequestCommand 只表达业务输入，不承载登录态；当前操作者由上层鉴权层注入。
 type ReviewRequestCommand struct {
-	TenantID   string
-	RequestNo  string
-	DecisionBy string
-	Comment    string
+	TenantID      string
+	RequestNo     string
+	DecisionBy    string
+	Comment       string
+	ApprovalLevel int
 }
 
 type ReviewResult struct {
@@ -392,11 +397,11 @@ func (service *Service) GetRequest(ctx context.Context, tenantID string, request
 }
 
 func (service *Service) ApproveRequest(ctx context.Context, command ReviewRequestCommand) (ReviewResult, error) {
-	return service.reviewRequest(ctx, command, domain.ApprovalStatusApproved, domain.RefundRequestStatusApproved)
+	return service.reviewRequest(ctx, command, domain.ApprovalStatusApproved)
 }
 
 func (service *Service) RejectRequest(ctx context.Context, command ReviewRequestCommand) (ReviewResult, error) {
-	return service.reviewRequest(ctx, command, domain.ApprovalStatusRejected, domain.RefundRequestStatusRejected)
+	return service.reviewRequest(ctx, command, domain.ApprovalStatusRejected)
 }
 
 // RecordTransaction 记录财务人工退款结果；只有已审批通过的申请才能结案。
@@ -470,6 +475,14 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 		return TransactionResult{}, err
 	}
 	if request.Status != domain.RefundRequestStatusApproved {
+		// 首次请求可能刚在前置幂等查询之后完成提交；状态冲突前再查一次，确保并发重试复用首次结果。
+		existingResult, found, idempotencyErr := service.repository.FindRefundTransactionByIdempotency(ctx, idempotency)
+		if idempotencyErr != nil {
+			return TransactionResult{}, idempotencyErr
+		}
+		if found {
+			return service.transactionResult(ctx, existingResult)
+		}
 		return TransactionResult{}, ErrRefundRequestNotApproved
 	}
 	if command.Amount != request.RequestedAmount {
@@ -530,6 +543,7 @@ func (service *Service) RecordTransaction(ctx context.Context, command RecordTra
 	return service.transactionResult(ctx, persistenceResult)
 }
 
+// 把数据库层返回的 TransactionPersistenceResult 转换为业务层最终要返回的 TransactionResult
 func (service *Service) transactionResult(ctx context.Context, persistenceResult TransactionPersistenceResult) (TransactionResult, error) {
 	detail, err := service.detail(ctx, persistenceResult.Request)
 	if err != nil {
@@ -573,7 +587,7 @@ func recordTransactionHash(command RecordTransactionCommand) (string, error) {
 }
 
 // reviewRequest 让通过和驳回共享同一套校验，避免重复处理审批人、状态和备注。
-func (service *Service) reviewRequest(ctx context.Context, command ReviewRequestCommand, approvalStatus domain.ApprovalStatus, requestStatus domain.RefundRequestStatus) (ReviewResult, error) {
+func (service *Service) reviewRequest(ctx context.Context, command ReviewRequestCommand, approvalStatus domain.ApprovalStatus) (ReviewResult, error) {
 	command.TenantID = strings.TrimSpace(command.TenantID)
 	command.RequestNo = strings.TrimSpace(command.RequestNo)
 	command.DecisionBy = strings.TrimSpace(command.DecisionBy)
@@ -591,6 +605,9 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 	if command.Comment == "" {
 		return ReviewResult{}, ErrApprovalCommentRequired
 	}
+	if command.ApprovalLevel < 0 || command.ApprovalLevel > 2 {
+		return ReviewResult{}, ErrApprovalLevelInvalid
+	}
 
 	request, err := service.repository.FindRefundRequestByRequestNo(ctx, command.TenantID, command.RequestNo)
 	if err != nil {
@@ -603,12 +620,37 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 		return ReviewResult{}, ErrApprovalActorSameAsSubmitter
 	}
 
+	approvals, err := service.repository.ListApprovalsByRequestNo(ctx, command.TenantID, request.RequestNo)
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	nextLevel := nextApprovalLevel(request, approvals, service.highAmountApprovalThreshold)
+	if command.ApprovalLevel != 0 && command.ApprovalLevel != nextLevel {
+		return ReviewResult{}, ErrApprovalLevelMismatch
+	}
+	if nextLevel > 2 {
+		return ReviewResult{}, ErrRefundRequestNotReviewable
+	}
+	for _, existingApproval := range approvals {
+		if existingApproval.DecisionBy == command.DecisionBy {
+			return ReviewResult{}, ErrApprovalActorAlreadyReviewed
+		}
+	}
+
+	requestStatus := domain.RefundRequestStatusRejected
+	if approvalStatus == domain.ApprovalStatusApproved {
+		requestStatus = domain.RefundRequestStatusApproved
+		if request.RequiresHighAmountApproval(service.highAmountApprovalThreshold) && nextLevel == 1 {
+			requestStatus = domain.RefundRequestStatusPendingReview
+		}
+	}
+
 	now := service.clock.Now().UTC()
 	approval := domain.Approval{
-		ID:              "approval_" + command.TenantID + "_" + request.RequestNo + "_1",
+		ID:              "approval_" + command.TenantID + "_" + request.RequestNo + "_" + fmt.Sprint(nextLevel),
 		TenantID:        command.TenantID,
 		RefundRequestID: request.ID,
-		Level:           1,
+		Level:           nextLevel,
 		Status:          approvalStatus,
 		AssigneeID:      command.DecisionBy,
 		DecisionBy:      command.DecisionBy,
@@ -616,7 +658,7 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 		Comment:         command.Comment,
 	}
 	auditLog := domain.AuditLog{
-		ID:         "audit_" + command.TenantID + "_" + request.RequestNo + "_" + string(approvalStatus),
+		ID:         "audit_" + command.TenantID + "_" + request.RequestNo + "_approval_" + fmt.Sprint(nextLevel) + "_" + strings.ToLower(string(approvalStatus)),
 		TenantID:   command.TenantID,
 		EntityType: "refund_request",
 		EntityID:   request.ID,
@@ -631,6 +673,7 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 			"decision_at":    now,
 			"comment":        command.Comment,
 			"approval_level": approval.Level,
+			"next_status":    requestStatus,
 		},
 		CreatedAt: now,
 	}
@@ -646,6 +689,21 @@ func (service *Service) reviewRequest(ctx context.Context, command ReviewRequest
 	}
 
 	return ReviewResult{Request: detail, Approval: approval}, nil
+}
+
+// 当前退款申请下一步需要几级审批
+func nextApprovalLevel(request domain.RefundRequest, approvals []domain.Approval, threshold int64) int {
+	if !request.RequiresHighAmountApproval(threshold) {
+		return 1
+	}
+
+	nextLevel := 1
+	for _, approval := range approvals {
+		if approval.Level >= nextLevel {
+			nextLevel = approval.Level + 1
+		}
+	}
+	return nextLevel
 }
 
 // detail 查询时把审批记录一并带回，方便前端渲染完整时间线。

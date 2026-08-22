@@ -21,24 +21,26 @@ const (
 type RoleCode string
 
 const (
-	RoleCustomerService RoleCode = "CUSTOMER_SERVICE"
-	RoleSupervisor      RoleCode = "SUPERVISOR"
-	RoleFinance         RoleCode = "FINANCE"
-	RoleWarehouse       RoleCode = "WAREHOUSE"
-	RoleOperatorAdmin   RoleCode = "OPERATOR_ADMIN"
-	RoleTenantAdmin     RoleCode = "TENANT_ADMIN"
+	RoleCustomerService   RoleCode = "CUSTOMER_SERVICE"		// 客服
+	RoleSupervisor        RoleCode = "SUPERVISOR"			// 主管
+	RoleFinance           RoleCode = "FINANCE"				// 财务
+	RoleFinanceSupervisor RoleCode = "FINANCE_SUPERVISOR"	// 财务主管
+	RoleWarehouse         RoleCode = "WAREHOUSE"			// 仓储人员
+	RoleOperatorAdmin     RoleCode = "OPERATOR_ADMIN"		// 运营管理员
+	RoleTenantAdmin       RoleCode = "TENANT_ADMIN"			// 租户管理员
 )
 
 // 权限
 type Permission string
 
 const (
-	PermissionOrderRead              Permission = "order:read"
-	PermissionRefundRequestCreate    Permission = "refund_request:create"
-	PermissionRefundRequestRead      Permission = "refund_request:read"
-	PermissionRefundRequestReview    Permission = "refund_request:review"
-	PermissionRefundTransactionWrite Permission = "refund_transaction:write"
-	PermissionTenantMemberManage     Permission = "tenant_member:manage"
+	PermissionOrderRead                     Permission = "order:read"
+	PermissionRefundRequestCreate           Permission = "refund_request:create"
+	PermissionRefundRequestRead             Permission = "refund_request:read"
+	PermissionRefundRequestReview           Permission = "refund_request:review"
+	PermissionRefundRequestHighAmountReview Permission = "refund_request:high_amount_review"
+	PermissionRefundTransactionWrite        Permission = "refund_transaction:write"
+	PermissionTenantMemberManage            Permission = "tenant_member:manage"
 )
 
 type Tenant struct {

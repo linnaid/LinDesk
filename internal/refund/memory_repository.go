@@ -89,6 +89,18 @@ func DemoOrders() []domain.Order {
 			PaidAt:            paidAt,
 		},
 		{
+			ID:                "order_1004",
+			TenantID:          "tenant_demo",
+			ExternalOrderNo:   "LD202608040004",
+			CustomerID:        "customer_1004",
+			PaymentStatus:     domain.PaymentStatusPaid,
+			FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+			PaidAmount:        60_000,
+			RefundedAmount:    0,
+			Currency:          "CNY",
+			PaidAt:            paidAt,
+		},
+		{
 			ID:                "order_acme_1001",
 			TenantID:          "tenant_acme",
 			ExternalOrderNo:   "LD202608040001",
@@ -231,6 +243,11 @@ func (repository *InMemoryRepository) ReviewRefundRequest(_ context.Context, ten
 	}
 	if request.Status != domain.RefundRequestStatusPendingReview {
 		return domain.RefundRequest{}, ErrRefundRequestNotReviewable
+	}
+	for _, existingApproval := range repository.approvals[key] {
+		if existingApproval.Level == approval.Level {
+			return domain.RefundRequest{}, ErrApprovalLevelAlreadyProcessed
+		}
 	}
 
 	request.Status = requestStatus

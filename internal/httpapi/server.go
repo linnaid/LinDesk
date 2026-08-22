@@ -50,8 +50,8 @@ func NewHandler(serviceName, version string, dependencies ...Dependencies) http.
 		mux.HandleFunc("GET /orders/{external_order_no}", requirePermission(deps.Auth, domain.PermissionOrderRead, handleGetOrder(deps.Refunds)))
 		mux.HandleFunc("POST /refund-requests", requirePermission(deps.Auth, domain.PermissionRefundRequestCreate, handleCreateRefundRequest(deps.Refunds)))
 		mux.HandleFunc("GET /refund-requests/{request_no}", requirePermission(deps.Auth, domain.PermissionRefundRequestRead, handleGetRefundRequest(deps.Refunds)))
-		mux.HandleFunc("POST /refund-requests/{request_no}/approve", requirePermission(deps.Auth, domain.PermissionRefundRequestReview, handleApproveRefundRequest(deps.Refunds)))
-		mux.HandleFunc("POST /refund-requests/{request_no}/reject", requirePermission(deps.Auth, domain.PermissionRefundRequestReview, handleRejectRefundRequest(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests/{request_no}/approve", requireAnyPermission(deps.Auth, []domain.Permission{domain.PermissionRefundRequestReview, domain.PermissionRefundRequestHighAmountReview}, handleApproveRefundRequest(deps.Refunds)))
+		mux.HandleFunc("POST /refund-requests/{request_no}/reject", requireAnyPermission(deps.Auth, []domain.Permission{domain.PermissionRefundRequestReview, domain.PermissionRefundRequestHighAmountReview}, handleRejectRefundRequest(deps.Refunds)))
 		mux.HandleFunc("POST /refund-requests/{request_no}/refund-transactions", requirePermission(deps.Auth, domain.PermissionRefundTransactionWrite, handleRecordRefundTransaction(deps.Refunds)))
 	}
 
@@ -133,6 +133,32 @@ func requirePermission(auths auth.Authenticator, permission domain.Permission, n
 
 		ctx := context.WithValue(request.Context(), actorContextKey{}, actor)
 		next(writer, request.WithContext(ctx))
+	}
+}
+
+// 判断当前请求是否登陆以及当前用户是否拥有指定权限
+// 客服主管和财务主管分别访问自己负责的审批级别
+func requireAnyPermission(auths auth.Authenticator, permissions []domain.Permission, next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if auths == nil {
+			next(writer, request)
+			return
+		}
+
+		actor, err := auths.Authenticate(request.Context(), bearerToken(request.Header.Get("Authorization")))
+		if err != nil {
+			writeAuthError(writer, err)
+			return
+		}
+		for _, permission := range permissions {
+			if actor.HasPermission(permission) {
+				ctx := context.WithValue(request.Context(), actorContextKey{}, actor)
+				next(writer, request.WithContext(ctx))
+				return
+			}
+		}
+
+		writeAuthError(writer, auth.ErrPermissionDenied)
 	}
 }
 
@@ -247,7 +273,8 @@ func handleRejectRefundRequest(refunds *apprefund.Service) http.HandlerFunc {
 
 func handleReviewRefundRequest(refunds *apprefund.Service, approved bool) http.HandlerFunc {
 	type payload struct {
-		Comment string `json:"comment"`
+		Comment       string `json:"comment"`
+		ApprovalLevel int    `json:"approval_level"`
 	}
 
 	return func(writer http.ResponseWriter, request *http.Request) {
@@ -265,11 +292,22 @@ func handleReviewRefundRequest(refunds *apprefund.Service, approved bool) http.H
 			return
 		}
 
+		approvalLevel, resolveErr := resolveReviewApprovalLevel(request, body.ApprovalLevel)
+		if resolveErr != nil {
+			if errors.Is(resolveErr, auth.ErrPermissionDenied) {
+				writeAuthError(writer, resolveErr)
+			} else {
+				writeServiceError(writer, resolveErr)
+			}
+			return
+		}
+
 		command := apprefund.ReviewRequestCommand{
-			TenantID:   currentTenantID(request),
-			RequestNo:  request.PathValue("request_no"),
-			DecisionBy: actorID,
-			Comment:    body.Comment,
+			TenantID:      currentTenantID(request),
+			RequestNo:     request.PathValue("request_no"),
+			DecisionBy:    actorID,
+			Comment:       body.Comment,
+			ApprovalLevel: approvalLevel,
 		}
 
 		var (
@@ -291,6 +329,38 @@ func handleReviewRefundRequest(refunds *apprefund.Service, approved bool) http.H
 			Approval: newApprovalResponse(result.Approval),
 		})
 	}
+}
+
+// 根据用户传进来的审批等级以及用户可审批权限返回最终审批等级
+func resolveReviewApprovalLevel(request *http.Request, requestedLevel int) (int, error) {
+	if requestedLevel < 0 || requestedLevel > 2 {
+		return 0, apprefund.ErrApprovalLevelInvalid
+	}
+
+	actor, ok := currentActor(request)
+	if !ok {
+		if requestedLevel == 0 {
+			return 1, nil
+		}
+		return requestedLevel, nil
+	}
+
+	hasFirstLevelPermission := actor.HasPermission(domain.PermissionRefundRequestReview)
+	hasSecondLevelPermission := actor.HasPermission(domain.PermissionRefundRequestHighAmountReview)
+	if requestedLevel == 0 {
+		if hasSecondLevelPermission && !hasFirstLevelPermission {
+			return 2, nil
+		}
+		return 1, nil
+	}
+	if requestedLevel == 1 && !hasFirstLevelPermission {
+		return 0, auth.ErrPermissionDenied
+	}
+	if requestedLevel == 2 && !hasSecondLevelPermission {
+		return 0, auth.ErrPermissionDenied
+	}
+
+	return requestedLevel, nil
 }
 
 func handleRecordRefundTransaction(refunds *apprefund.Service) http.HandlerFunc {
@@ -599,11 +669,17 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 		errors.Is(err, apprefund.ErrSubmittedByRequired),
 		errors.Is(err, apprefund.ErrReviewRequestNoRequired),
 		errors.Is(err, apprefund.ErrApprovalDecisionByRequired),
-		errors.Is(err, apprefund.ErrApprovalCommentRequired):
+		errors.Is(err, apprefund.ErrApprovalCommentRequired),
+		errors.Is(err, apprefund.ErrApprovalLevelInvalid):
 		writeError(writer, http.StatusBadRequest, "validation_failed", err.Error())
 	// 403 权限禁止
 	case errors.Is(err, apprefund.ErrApprovalActorSameAsSubmitter):
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error())
+	// 409 审批操作与当前审批状态发生冲突
+	case errors.Is(err, apprefund.ErrApprovalActorAlreadyReviewed),
+		errors.Is(err, apprefund.ErrApprovalLevelMismatch),
+		errors.Is(err, apprefund.ErrApprovalLevelAlreadyProcessed):
+		writeError(writer, http.StatusConflict, "approval_level_conflict", err.Error())
 	// 409 退款申请状态错误
 	case errors.Is(err, apprefund.ErrRefundRequestNotReviewable):
 		writeError(writer, http.StatusConflict, "refund_request_not_reviewable", err.Error())

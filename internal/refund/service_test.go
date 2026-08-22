@@ -298,6 +298,158 @@ func TestCreateRequestMarksHighAmountRequest(t *testing.T) {
 	}
 }
 
+func TestHighAmountRequestRequiresTwoApprovals(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository([]domain.Order{
+		{
+			ID:                "order_high_approval",
+			TenantID:          demoTenantID,
+			ExternalOrderNo:   "LD202608040098",
+			CustomerID:        "customer_high_approval",
+			PaymentStatus:     domain.PaymentStatusPaid,
+			FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+			PaidAmount:        60_000,
+			Currency:          "CNY",
+			PaidAt:            now,
+		},
+	})
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
+		ExternalOrderNo: "LD202608040098",
+		RequestedAmount: 50_000,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}); err != nil {
+		t.Fatalf("CreateRequest() error = %v", err)
+	}
+
+	firstReview, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:      demoTenantID,
+		RequestNo:     "RR202608040001",
+		DecisionBy:    "user_supervisor_001",
+		Comment:       "客服主管确认订单未发货",
+		ApprovalLevel: 1,
+	})
+	if err != nil {
+		t.Fatalf("first ApproveRequest() error = %v", err)
+	}
+	if firstReview.Request.Request.Status != domain.RefundRequestStatusPendingReview {
+		t.Fatalf("first review status = %q, want %q", firstReview.Request.Request.Status, domain.RefundRequestStatusPendingReview)
+	}
+	if firstReview.Approval.Level != 1 || len(firstReview.Request.Approvals) != 1 {
+		t.Fatalf("first review approval = %+v, approvals = %+v", firstReview.Approval, firstReview.Request.Approvals)
+	}
+
+	secondReview, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:      demoTenantID,
+		RequestNo:     "RR202608040001",
+		DecisionBy:    "user_finance_supervisor_001",
+		Comment:       "财务主管确认高金额退款",
+		ApprovalLevel: 2,
+	})
+	if err != nil {
+		t.Fatalf("second ApproveRequest() error = %v", err)
+	}
+	if secondReview.Request.Request.Status != domain.RefundRequestStatusApproved {
+		t.Fatalf("second review status = %q, want %q", secondReview.Request.Request.Status, domain.RefundRequestStatusApproved)
+	}
+	if secondReview.Approval.Level != 2 || len(secondReview.Request.Approvals) != 2 {
+		t.Fatalf("second review approval = %+v, approvals = %+v", secondReview.Approval, secondReview.Request.Approvals)
+	}
+}
+
+func TestHighAmountRequestRejectsLevelTwoBeforeLevelOne(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository([]domain.Order{{
+		ID:                "order_high_approval_ordered",
+		TenantID:          demoTenantID,
+		ExternalOrderNo:   "LD202608040097",
+		CustomerID:        "customer_high_approval_ordered",
+		PaymentStatus:     domain.PaymentStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+		PaidAmount:        60_000,
+		Currency:          "CNY",
+		PaidAt:            now,
+	}})
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
+		ExternalOrderNo: "LD202608040097",
+		RequestedAmount: 50_000,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}); err != nil {
+		t.Fatalf("CreateRequest() error = %v", err)
+	}
+
+	_, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:      demoTenantID,
+		RequestNo:     "RR202608040001",
+		DecisionBy:    "user_finance_supervisor_001",
+		Comment:       "不允许越过一级审批",
+		ApprovalLevel: 2,
+	})
+	if !errors.Is(err, ErrApprovalLevelMismatch) {
+		t.Fatalf("ApproveRequest() error = %v, want %v", err, ErrApprovalLevelMismatch)
+	}
+}
+
+func TestHighAmountRequestSecondLevelRejectionEndsRequest(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := NewInMemoryRepository([]domain.Order{{
+		ID:                "order_high_rejected",
+		TenantID:          demoTenantID,
+		ExternalOrderNo:   "LD202608040096",
+		CustomerID:        "customer_high_rejected",
+		PaymentStatus:     domain.PaymentStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+		PaidAmount:        60_000,
+		Currency:          "CNY",
+		PaidAt:            now,
+	}})
+	service := NewService(repository, 50_000, fixedClock{now: now}, NewSequentialRequestNumberGenerator())
+	if _, err := service.CreateRequest(context.Background(), CreateRequestCommand{
+		TenantID:        demoTenantID,
+		IdempotencyKey:  testIdempotencyKey,
+		ExternalOrderNo: "LD202608040096",
+		RequestedAmount: 50_000,
+		ReasonCode:      "CUSTOMER_CANCELLED",
+		SubmittedBy:     "user_cs_001",
+	}); err != nil {
+		t.Fatalf("CreateRequest() error = %v", err)
+	}
+	if _, err := service.ApproveRequest(context.Background(), ReviewRequestCommand{
+		TenantID:      demoTenantID,
+		RequestNo:     "RR202608040001",
+		DecisionBy:    "user_supervisor_001",
+		Comment:       "一级审核通过",
+		ApprovalLevel: 1,
+	}); err != nil {
+		t.Fatalf("first ApproveRequest() error = %v", err)
+	}
+
+	result, err := service.RejectRequest(context.Background(), ReviewRequestCommand{
+		TenantID:      demoTenantID,
+		RequestNo:     "RR202608040001",
+		DecisionBy:    "user_finance_supervisor_001",
+		Comment:       "高金额风险不通过",
+		ApprovalLevel: 2,
+	})
+	if err != nil {
+		t.Fatalf("RejectRequest() error = %v", err)
+	}
+	if result.Request.Request.Status != domain.RefundRequestStatusRejected || result.Approval.Level != 2 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(repository.AuditLogs()) != 3 {
+		t.Fatalf("AuditLogs length = %d, want 3", len(repository.AuditLogs()))
+	}
+}
+
 func TestCreateRequestRejectsIneligibleOrder(t *testing.T) {
 	repository := NewInMemoryRepository(DemoOrders())
 	service := NewService(repository, 50_000, fixedClock{now: time.Now()}, NewSequentialRequestNumberGenerator())

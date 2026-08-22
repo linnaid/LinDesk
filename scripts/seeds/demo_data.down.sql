@@ -25,14 +25,16 @@ BEGIN
             'user_cs_001',
             'user_supervisor_001',
             'user_finance_001',
+            'user_finance_supervisor_001',
             'user_admin_001',
             'user_acme_cs_001',
             'user_acme_supervisor_001',
-            'user_acme_finance_001'
+            'user_acme_finance_001',
+            'user_acme_finance_supervisor_001'
         );
     END IF;
     IF to_regclass('public.roles') IS NOT NULL THEN
-        DELETE FROM roles WHERE code IN ('CUSTOMER_SERVICE', 'SUPERVISOR', 'FINANCE', 'TENANT_ADMIN');
+        DELETE FROM roles WHERE code IN ('CUSTOMER_SERVICE', 'SUPERVISOR', 'FINANCE', 'FINANCE_SUPERVISOR', 'TENANT_ADMIN');
     END IF;
     IF to_regclass('public.tenants') IS NOT NULL THEN
         DELETE FROM tenants WHERE id IN ('tenant_demo', 'tenant_acme');

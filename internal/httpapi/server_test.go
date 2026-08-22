@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"lindesk/internal/auth"
+	"lindesk/internal/domain"
 	"lindesk/internal/refund"
 )
 
@@ -346,6 +347,148 @@ func TestRefundFlowWithLoginAndRBAC(t *testing.T) {
 	handler.ServeHTTP(transactionResponse, transactionRequest)
 	if transactionResponse.Code != http.StatusOK {
 		t.Fatalf("transaction status = %d, want %d, body = %s", transactionResponse.Code, http.StatusOK, transactionResponse.Body.String())
+	}
+}
+
+func TestHighAmountRefundFlowRequiresFinanceSupervisorApproval(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := refund.NewInMemoryRepository([]domain.Order{{
+		ID:                "order_high_http",
+		TenantID:          demoTenantID,
+		ExternalOrderNo:   "LD202608040099",
+		CustomerID:        "customer_high_http",
+		PaymentStatus:     domain.PaymentStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+		PaidAmount:        60_000,
+		Currency:          "CNY",
+		PaidAt:            now,
+	}})
+	refundService := refund.NewService(repository, 50_000, fixedHTTPClock{now: now}, refund.NewSequentialRequestNumberGenerator())
+	authService := auth.NewDemoService()
+	handler := NewHandler("lindesk", "test", Dependencies{Refunds: refundService, Auth: authService})
+
+	csToken := loginToken(t, handler, "cs@lindesk.local")
+	supervisorToken := loginToken(t, handler, "supervisor@lindesk.local")
+	financeSupervisorToken := loginToken(t, handler, "finance.supervisor@lindesk.local")
+	financeToken := loginToken(t, handler, "finance@lindesk.local")
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040099",
+  "requested_amount": 50000,
+  "reason_code": "CUSTOMER_CANCELLED"
+}`))
+	createRequest.Header.Set("Authorization", "Bearer "+csToken)
+	createRequest.Header.Set("Idempotency-Key", "high-amount-http-create")
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body = %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+
+	firstApproval := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{"comment":"客服主管一级审核通过"}`))
+	firstApproval.Header.Set("Authorization", "Bearer "+supervisorToken)
+	firstApprovalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstApprovalResponse, firstApproval)
+	if firstApprovalResponse.Code != http.StatusOK {
+		t.Fatalf("first approval status = %d, want %d, body = %s", firstApprovalResponse.Code, http.StatusOK, firstApprovalResponse.Body.String())
+	}
+	var firstApprovalBody struct {
+		Request struct {
+			Status string `json:"status"`
+		} `json:"request"`
+		Approval struct {
+			Level int `json:"level"`
+		} `json:"approval"`
+	}
+	if err := json.NewDecoder(firstApprovalResponse.Body).Decode(&firstApprovalBody); err != nil {
+		t.Fatalf("decode first approval response: %v", err)
+	}
+	if firstApprovalBody.Request.Status != "PENDING_REVIEW" || firstApprovalBody.Approval.Level != 1 {
+		t.Fatalf("first approval body = %+v", firstApprovalBody)
+	}
+
+	prematureTransaction := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/refund-transactions", strings.NewReader(`{
+  "provider":"alipay","provider_refund_no":"ALI-HIGH-001","amount":50000,"status":"SUCCEEDED"
+}`))
+	prematureTransaction.Header.Set("Authorization", "Bearer "+financeToken)
+	prematureTransaction.Header.Set("Idempotency-Key", "high-amount-premature-transaction")
+	prematureResponse := httptest.NewRecorder()
+	handler.ServeHTTP(prematureResponse, prematureTransaction)
+	if prematureResponse.Code != http.StatusConflict {
+		t.Fatalf("premature transaction status = %d, want %d, body = %s", prematureResponse.Code, http.StatusConflict, prematureResponse.Body.String())
+	}
+
+	secondApproval := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{"comment":"财务主管二级审核通过","approval_level":2}`))
+	secondApproval.Header.Set("Authorization", "Bearer "+financeSupervisorToken)
+	secondApprovalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondApprovalResponse, secondApproval)
+	if secondApprovalResponse.Code != http.StatusOK {
+		t.Fatalf("second approval status = %d, want %d, body = %s", secondApprovalResponse.Code, http.StatusOK, secondApprovalResponse.Body.String())
+	}
+}
+
+func TestTenantAdminCanExplicitlyCompleteSecondLevelApproval(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 3, 0, 0, 0, time.UTC)
+	repository := refund.NewInMemoryRepository([]domain.Order{{
+		ID:                "order_high_admin_http",
+		TenantID:          demoTenantID,
+		ExternalOrderNo:   "LD202608040100",
+		CustomerID:        "customer_high_admin_http",
+		PaymentStatus:     domain.PaymentStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusNotShipped,
+		PaidAmount:        60_000,
+		Currency:          "CNY",
+		PaidAt:            now,
+	}})
+	refundService := refund.NewService(repository, 50_000, fixedHTTPClock{now: now}, refund.NewSequentialRequestNumberGenerator())
+	handler := NewHandler("lindesk", "test", Dependencies{Refunds: refundService, Auth: auth.NewDemoService()})
+
+	adminToken := loginToken(t, handler, "admin@lindesk.local")
+	supervisorToken := loginToken(t, handler, "supervisor@lindesk.local")
+	createToken := loginToken(t, handler, "cs@lindesk.local")
+	createRequest := httptest.NewRequest(http.MethodPost, "/refund-requests", strings.NewReader(`{
+  "external_order_no": "LD202608040100",
+  "requested_amount": 50000,
+  "reason_code": "CUSTOMER_CANCELLED"
+}`))
+	createRequest.Header.Set("Authorization", "Bearer "+createToken)
+	createRequest.Header.Set("Idempotency-Key", "high-amount-admin-http-create")
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body = %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+
+	firstApproval := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{"comment":"客服主管完成一级审批","approval_level":1}`))
+	firstApproval.Header.Set("Authorization", "Bearer "+supervisorToken)
+	firstApprovalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstApprovalResponse, firstApproval)
+	if firstApprovalResponse.Code != http.StatusOK {
+		t.Fatalf("level 1 approval status = %d, want %d, body = %s", firstApprovalResponse.Code, http.StatusOK, firstApprovalResponse.Body.String())
+	}
+
+	secondApproval := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(fmt.Sprintf(`{"comment":%q,"approval_level":2}`, "企业管理员完成二级审批")))
+	secondApproval.Header.Set("Authorization", "Bearer "+adminToken)
+	secondApprovalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondApprovalResponse, secondApproval)
+	if secondApprovalResponse.Code != http.StatusOK {
+		t.Fatalf("level 2 approval status = %d, want %d, body = %s", secondApprovalResponse.Code, http.StatusOK, secondApprovalResponse.Body.String())
+	}
+}
+
+func TestReviewApprovalLevelRequiresMatchingPermission(t *testing.T) {
+	handler := newSecureTestHandler()
+	supervisorToken := loginToken(t, handler, "supervisor@lindesk.local")
+	request := httptest.NewRequest(http.MethodPost, "/refund-requests/RR202608040001/approve", strings.NewReader(`{
+  "comment": "越权审批",
+  "approval_level": 2
+}`))
+	request.Header.Set("Authorization", "Bearer "+supervisorToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d, body = %s", response.Code, http.StatusForbidden, response.Body.String())
 	}
 }
 

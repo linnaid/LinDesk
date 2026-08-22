@@ -293,6 +293,19 @@ FOR UPDATE
 		if request.Status != domain.RefundRequestStatusPendingReview {
 			return ErrRefundRequestNotReviewable
 		}
+		var approvalExists bool
+		if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM approvals
+    WHERE tenant_id = $1 AND refund_request_id = $2 AND level = $3
+)
+`, tenantID, request.ID, approval.Level).Scan(&approvalExists); err != nil {
+			return err
+		}
+		if approvalExists {
+			return ErrApprovalLevelAlreadyProcessed
+		}
 
 		request.Status = requestStatus
 		if _, err := tx.ExecContext(ctx, `
